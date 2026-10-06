@@ -46,3 +46,10 @@ def test_startup_env_file_overrides_stale_exported_configuration(tmp_path) -> No
     assert result.returncode == 0, result.stderr
 
 
+def test_compose_price_file_covers_example_aliases() -> None:
+    aliases = json.loads(dotenv_values(ROOT / ".env.example")["GATEWAY_MODEL_ALIASES"])
+    prices = json.loads((ROOT / "prices.live.json").read_text(encoding="utf-8"))["models"]
+    assert all(model in prices[provider] for route in aliases.values()
+               for provider, model in route["models"].items())
+    assert "COPY prices.live.json ./prices.live.json" in (ROOT / "Dockerfile").read_text()
+    assert "GATEWAY_PRICE_CONFIG_PATH: /app/prices.live.json" in (ROOT / "compose.yaml").read_text()
