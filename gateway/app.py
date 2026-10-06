@@ -14,11 +14,13 @@ from uuid import UUID, uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from redis.exceptions import RedisError
 
 from gateway.config import ModelAlias, load_model_aliases
 from gateway.providers.anthropic import AnthropicProvider
 from gateway.providers.base import FailureReason, GenerationOptions, Message, Provider
 from gateway.providers.openai import OpenAIProvider
+from gateway.redis_store import GatewayStore, RedisStore, make_cache_key
 from gateway.routing import RetryPolicy, RouteFailure, generate_with_fallback
 
 
@@ -41,6 +43,7 @@ class ChatRequest(BaseModel):
     max_tokens: int = Field(default=1024, ge=1)
     temperature: float | None = Field(default=None, ge=0, le=1)
     provider: Literal["openai", "anthropic"] | None = None
+    cache: bool = False
 
     @model_validator(mode="after")
     def validate_conversation(self) -> "ChatRequest":
@@ -93,11 +96,13 @@ def create_app(
     providers: Mapping[str, Provider] | None = None,
     model_aliases: Mapping[str, ModelAlias] | None = None,
     retry_policy: RetryPolicy | None = None,
+    redis_store: GatewayStore | None = None,
 ) -> FastAPI:
     configured_key = gateway_api_key if gateway_api_key is not None else os.getenv("GATEWAY_API_KEY", "")
     configured_key_hash = hashlib.sha256(configured_key.encode()).digest() if configured_key else None
     aliases = model_aliases if model_aliases is not None else load_model_aliases()
     policy = retry_policy if retry_policy is not None else RetryPolicy.from_env()
+    store = redis_store if redis_store is not None else RedisStore.from_env()
     selected_providers = dict(providers) if providers is not None else {}
     if providers is None:
         if provider_key := os.getenv("OPENAI_API_KEY"):
@@ -110,6 +115,8 @@ def create_app(
         try:
             yield
         finally:
+            if isinstance(store, RedisStore) and redis_store is None:
+                await store.aclose()
             for provider in selected_providers.values():
                 if isinstance(provider, (OpenAIProvider, AnthropicProvider)):
                     await provider.aclose()
@@ -155,6 +162,13 @@ def create_app(
         trace: RequestContext = http_request.state.telemetry
 
         assert trace.gateway_key_id is not None
+        try:
+            allowed = await store.allow(trace.gateway_key_id)
+        except RedisError as exc:
+            logger.warning("Redis rate limiter is unavailable: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Rate limiter unavailable") from exc
+        if not allowed:
+            raise HTTPException(status_code=429, detail="Gateway rate limit exceeded")
         if not aliases:
             raise HTTPException(status_code=503, detail="Model aliases are not configured")
         route = aliases.get(request.model)
@@ -173,6 +187,38 @@ def create_app(
 
         messages = [Message(role=item.role, content=item.content) for item in request.messages]
         options = GenerationOptions(max_tokens=request.max_tokens, temperature=request.temperature)
+        cache_key = None
+        if request.cache and request.temperature == 0 and request.messages[-1].role == "user":
+            cache_key = make_cache_key(
+                key_hash=trace.gateway_key_id,
+                provider=provider_name,
+                model=model,
+                messages=messages,
+                options=options,
+            )
+            try:
+                cached_json = await store.get_cached(cache_key)
+            except RedisError as exc:
+                logger.warning("Redis cache read failed: %s", type(exc).__name__)
+            else:
+                if cached_json is not None:
+                    try:
+                        cached_response = ChatResponse.model_validate_json(cached_json)
+                    except ValidationError:
+                        logger.warning("Ignoring invalid cached chat response")
+                    else:
+
+
+
+
+
+                        return cached_response.model_copy(update={
+                            "request_id": str(trace.request_id),
+                            "cache_hit": True,
+                            "attempts": [],
+                            "retry_count": 0,
+                            "failure_reason": None,
+                        })
         request_id = str(trace.request_id)
         try:
             outcome = await generate_with_fallback(
@@ -245,6 +291,11 @@ def create_app(
                 for attempt in outcome.attempts
             ],
         )
+        if cache_key is not None and outcome.retry_count == 0 and outcome.final_provider == provider_name:
+            try:
+                await store.put_cached(cache_key, response.model_dump_json())
+            except RedisError as exc:
+                logger.warning("Redis cache write failed: %s", type(exc).__name__)
         return response
 
     return app

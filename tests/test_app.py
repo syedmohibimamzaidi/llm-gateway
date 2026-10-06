@@ -20,6 +20,7 @@ class UnlimitedStore:
 
 
 def create_app(**kwargs):
+    kwargs.setdefault("redis_store", UnlimitedStore())
     return build_app(**kwargs)
 
 

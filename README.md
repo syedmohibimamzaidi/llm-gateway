@@ -20,3 +20,5 @@ Copy `.env.example` to `.env` and configure a gateway key, model aliases and pro
 `gateway.main` loads `.env` before app creation and overrides stale exported values. `POST /v1/chat` accepts a model alias, messages, generation parameters and an optional strict provider override. Callers use a bearer gateway key; provider keys are used by the adapters. Tests inject fake providers and never make paid calls.
 
 Transient timeouts, rate limits and server errors receive bounded exponential retries and compatible fallback. Explicit provider overrides stay on that provider. Authentication and invalid-request errors are not retried. The default provider-routing deadline is 45 seconds.
+
+Redis is required for per-key rate limiting. The rate limit runs before cache lookup. Caching is opt-in, requires temperature zero and a final user message, and isolates keys/providers/models/messages/generation options. Redis rate-limit failures return 503; cache-only errors bypass caching. Configure `REDIS_URL`, the rate window/threshold and cache TTL in `.env`.
