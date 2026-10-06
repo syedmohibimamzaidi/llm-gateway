@@ -32,3 +32,5 @@ Configure `DATABASE_URL` and apply `migrations/001_request_telemetry.sql` with `
 Run real-service checks by setting `TEST_DATABASE_URL` and `TEST_REDIS_URL` before `.venv/bin/python -m pytest -q`. These tests remove only their random fixture rows and Redis keys.
 
 Authenticated `/analytics/summary`, `/analytics/providers` and `/requests` expose only the caller key’s metadata. Choose `window=1h|24h|7d|30d`; history supports `limit` and `offset`, ordered by descending timestamp and request ID. Analytics failures return 503.
+
+Apply `migrations/002_gateway_keys.sql` to enable managed keys. Only the configured management key may create, list or revoke keys through `/api-keys`. Raw created keys are returned once; PostgreSQL stores only hashes. Revoked keys are rejected immediately.

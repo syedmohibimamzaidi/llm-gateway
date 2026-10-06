@@ -18,6 +18,7 @@ from redis.exceptions import RedisError
 
 from gateway.analytics import AnalyticsRepository, PostgresAnalyticsRepository, window_bounds
 from gateway.config import ModelAlias, load_model_aliases
+from gateway.keys import KeyRecord, KeyRepository, PostgresKeyRepository
 from gateway.providers.anthropic import AnthropicProvider
 from gateway.providers.base import FailureReason, GenerationOptions, Message, Provider
 from gateway.providers.openai import OpenAIProvider
@@ -87,6 +88,22 @@ class ChatResponse(BaseModel):
     cache_hit: bool = False
 
 
+class KeyCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=100)
+
+
+class KeyMetadata(BaseModel):
+    id: UUID
+    name: str
+    created_at: datetime
+    revoked_at: datetime | None
+
+
+class KeyCreated(KeyMetadata):
+    key: str
+
+
 def create_app(
     *,
     gateway_api_key: str | None = None,
@@ -97,6 +114,7 @@ def create_app(
     price_book: PriceBook | None = None,
     telemetry_repository: TelemetryRepository | None = None,
     analytics_repository: AnalyticsRepository | None = None,
+    key_repository: KeyRepository | None = None,
 ) -> FastAPI:
     configured_key = gateway_api_key if gateway_api_key is not None else os.getenv("GATEWAY_API_KEY", "")
     configured_key_hash = hashlib.sha256(configured_key.encode()).digest() if configured_key else None
@@ -111,6 +129,10 @@ def create_app(
     )
     analytics = analytics_repository or (
         PostgresAnalyticsRepository(repository.pool)
+        if isinstance(repository, PostgresTelemetryRepository) else None
+    )
+    keys = key_repository or (
+        PostgresKeyRepository(repository.pool)
         if isinstance(repository, PostgresTelemetryRepository) else None
     )
     selected_providers = dict(providers) if providers is not None else {}
@@ -207,7 +229,67 @@ def create_app(
         supplied_hash = hashlib.sha256(token.encode()).digest()
         if hmac.compare_digest(supplied_hash, configured_key_hash):
             return configured_key_hash.hex()
+        if not token.startswith("gw_") or keys is None:
+            raise HTTPException(status_code=401, detail="Invalid gateway API key")
+        if await read_keys(keys.is_active(supplied_hash.hex())):
+            return supplied_hash.hex()
         raise HTTPException(status_code=401, detail="Invalid gateway API key")
+
+    async def authenticate_manager(authorization: Annotated[str | None, Header()] = None) -> str:
+        key_id = await authenticate_gateway_key(authorization)
+        if key_id != configured_key_hash.hex():
+            raise HTTPException(status_code=403, detail="Key management requires the configured gateway key")
+        return key_id
+
+    async def read_keys(operation: Awaitable[T]) -> T:
+        try:
+            async with asyncio.timeout(3):
+                return await operation
+        except Exception as exc:
+            logger.warning("PostgreSQL key operation failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Key management unavailable") from exc
+
+    def key_source() -> KeyRepository:
+        if keys is None:
+            raise HTTPException(status_code=503, detail="Key management is not configured")
+        return keys
+
+    def key_metadata(record: KeyRecord) -> KeyMetadata:
+        return KeyMetadata(id=record.id, name=record.name,
+                           created_at=record.created_at, revoked_at=record.revoked_at)
+
+    @app.post("/api-keys", response_model=KeyCreated, status_code=201)
+    async def create_key(
+        request: KeyCreateRequest,
+        response: Response,
+        _: Annotated[str, Depends(authenticate_manager)],
+    ) -> KeyCreated:
+        response.headers["Cache-Control"] = "no-store"
+        raw_key = "gw_" + secrets.token_urlsafe(32)
+        record = await read_keys(key_source().create(
+            uuid4(), hashlib.sha256(raw_key.encode()).hexdigest(), request.name
+        ))
+        return KeyCreated(**key_metadata(record).model_dump(), key=raw_key)
+
+    @app.get("/api-keys", response_model=list[KeyMetadata])
+    async def list_keys(
+        response: Response,
+        _: Annotated[str, Depends(authenticate_manager)],
+    ) -> list[KeyMetadata]:
+        response.headers["Cache-Control"] = "no-store"
+        return [key_metadata(record) for record in await read_keys(key_source().list())]
+
+    @app.delete("/api-keys/{key_id}", response_model=KeyMetadata)
+    async def revoke_key(
+        key_id: UUID,
+        response: Response,
+        _: Annotated[str, Depends(authenticate_manager)],
+    ) -> KeyMetadata:
+        response.headers["Cache-Control"] = "no-store"
+        record = await read_keys(key_source().revoke(key_id))
+        if record is None:
+            raise HTTPException(status_code=404, detail="Gateway key not found")
+        return key_metadata(record)
 
     async def read_analytics(operation: Awaitable[T]) -> T:
         try:
