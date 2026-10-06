@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from redis.exceptions import RedisError
 
+from gateway.analytics import AnalyticsRepository, PostgresAnalyticsRepository, window_bounds
 from gateway.config import ModelAlias, load_model_aliases
 from gateway.providers.anthropic import AnthropicProvider
 from gateway.providers.base import FailureReason, GenerationOptions, Message, Provider
@@ -95,6 +96,7 @@ def create_app(
     redis_store: GatewayStore | None = None,
     price_book: PriceBook | None = None,
     telemetry_repository: TelemetryRepository | None = None,
+    analytics_repository: AnalyticsRepository | None = None,
 ) -> FastAPI:
     configured_key = gateway_api_key if gateway_api_key is not None else os.getenv("GATEWAY_API_KEY", "")
     configured_key_hash = hashlib.sha256(configured_key.encode()).digest() if configured_key else None
@@ -106,6 +108,10 @@ def create_app(
         telemetry_repository
         if telemetry_repository is not None
         else PostgresTelemetryRepository.from_env()
+    )
+    analytics = analytics_repository or (
+        PostgresAnalyticsRepository(repository.pool)
+        if isinstance(repository, PostgresTelemetryRepository) else None
     )
     selected_providers = dict(providers) if providers is not None else {}
     if providers is None:
@@ -202,6 +208,59 @@ def create_app(
         if hmac.compare_digest(supplied_hash, configured_key_hash):
             return configured_key_hash.hex()
         raise HTTPException(status_code=401, detail="Invalid gateway API key")
+
+    async def read_analytics(operation: Awaitable[T]) -> T:
+        try:
+            async with asyncio.timeout(3):
+                return await operation
+        except Exception as exc:
+            logger.warning("PostgreSQL analytics read failed: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Analytics unavailable") from exc
+
+    def analytics_source() -> AnalyticsRepository:
+        if analytics is None:
+            raise HTTPException(status_code=503, detail="Analytics is not configured")
+        return analytics
+
+    @app.get("/analytics/summary")
+    async def analytics_summary(
+        response: Response,
+        key_id: Annotated[str, Depends(authenticate_gateway_key)],
+        window: Literal["1h", "24h", "7d", "30d"] = "24h",
+    ) -> dict:
+        response.headers["Cache-Control"] = "no-store"
+        start, end = window_bounds(window)
+        metrics = await read_analytics(analytics_source().summary(key_id, start, end))
+        return {"window": window, "start": start, "end": end, **metrics}
+
+    @app.get("/analytics/providers")
+    async def analytics_providers(
+        response: Response,
+        key_id: Annotated[str, Depends(authenticate_gateway_key)],
+        window: Literal["1h", "24h", "7d", "30d"] = "24h",
+    ) -> dict:
+        response.headers["Cache-Control"] = "no-store"
+        start, end = window_bounds(window)
+        providers = await read_analytics(analytics_source().providers(key_id, start, end))
+        return {"window": window, "start": start, "end": end, "providers": providers}
+
+    @app.get("/requests")
+    async def analytics_requests(
+        response: Response,
+        key_id: Annotated[str, Depends(authenticate_gateway_key)],
+        window: Literal["1h", "24h", "7d", "30d"] = "24h",
+        limit: int = Query(default=25, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        response.headers["Cache-Control"] = "no-store"
+        start, end = window_bounds(window)
+        total, items = await read_analytics(
+            analytics_source().requests(key_id, start, end, limit, offset)
+        )
+        return {
+            "window": window, "start": start, "end": end,
+            "total": total, "limit": limit, "offset": offset, "items": items,
+        }
 
     @app.post("/v1/chat", response_model=ChatResponse)
     async def chat(
