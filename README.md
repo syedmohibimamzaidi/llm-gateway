@@ -34,3 +34,15 @@ Run real-service checks by setting `TEST_DATABASE_URL` and `TEST_REDIS_URL` befo
 Authenticated `/analytics/summary`, `/analytics/providers` and `/requests` expose only the caller key’s metadata. Choose `window=1h|24h|7d|30d`; history supports `limit` and `offset`, ordered by descending timestamp and request ID. Analytics failures return 503.
 
 Apply `migrations/002_gateway_keys.sql` to enable managed keys. Only the configured management key may create, list or revoke keys through `/api-keys`. Raw created keys are returned once; PostgreSQL stores only hashes. Revoked keys are rejected immediately.
+
+## Dashboard
+
+With the API running on port 8000:
+
+```sh
+cd dashboard
+npm ci
+npm run dev
+```
+
+Open http://127.0.0.1:5173 and enter a gateway key. It stays in page memory. The Vite proxy supplies authenticated analytics; the dashboard includes time filters and 25-row Next/Previous pagination. Run `npm test` and `npm run build`.

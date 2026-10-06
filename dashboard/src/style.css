@@ -1,0 +1,69 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+:root { font-family: 'DM Sans', sans-serif; color: #17211f; background: #f5f7f4; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, select { font: inherit; }
+button { cursor: pointer; }
+.page { min-height: 100vh; display: flex; flex-direction: column; }
+.masthead { height: 76px; padding: 0 max(4vw, 24px); display: flex; align-items: center; justify-content: space-between; background: #fff; border-bottom: 1px solid #e1e8e3; }
+.brand { display: flex; gap: 11px; align-items: center; font-family: 'Space Grotesk', sans-serif; font-size: 19px; letter-spacing: -.6px; }
+.brand b { color: #198465; }
+.brand-mark { display: inline-grid; place-items: center; width: 36px; height: 36px; border-radius: 10px; background: #166f57; color: white; font-weight: 700; font-size: 20px; }
+.environment, .eyebrow { color: #237e64; font-size: 11px; font-weight: 700; letter-spacing: .14em; }
+.environment { border: 1px solid #b9dfd0; border-radius: 100px; padding: 8px 12px; }
+main { width: min(1380px, 100%); margin: 0 auto; padding: 44px max(4vw, 24px) 64px; flex: 1; }
+.intro { display: flex; align-items: start; justify-content: space-between; gap: 20px; margin-bottom: 30px; }
+.eyebrow { margin: 0 0 12px; }
+h1, h2, p { margin-top: 0; }
+h1, h2 { font-family: 'Space Grotesk', sans-serif; letter-spacing: -.045em; }
+h1 { font-size: clamp(32px, 4vw, 52px); line-height: 1.08; margin-bottom: 12px; }
+h2 { font-size: 21px; margin-bottom: 0; }
+.subhead { color: #697a73; font-size: 16px; margin-bottom: 0; }
+.connect-panel { max-width: 790px; background: #fff; padding: 30px; border: 1px solid #e1e8e3; border-radius: 18px; box-shadow: 0 8px 30px #17382a0a; display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+.connect-panel p { color: #697a73; margin: 10px 0 0; line-height: 1.5; }
+.connect-controls label, .range-control label { display: block; font-size: 12px; font-weight: 700; color: #50635b; margin-bottom: 8px; }
+.input-row { display: flex; gap: 8px; }
+input, select { border: 1px solid #cbd7d0; border-radius: 9px; background: #fff; color: #17211f; padding: 11px 12px; outline-color: #198465; }
+.input-row input { min-width: 0; width: 100%; }
+.primary-button { border: 0; border-radius: 9px; background: #167b5e; color: white; padding: 11px 18px; font-weight: 700; }
+.primary-button:hover { background: #10664f; }
+.text-button { background: none; border: 0; color: #586d61; text-decoration: underline; padding: 8px 0; }
+.toolbar { display: flex; align-items: end; justify-content: space-between; margin-bottom: 24px; }
+.range-control select { min-width: 160px; }
+.secondary-button { border: 1px solid #cbd7d0; background: #fff; padding: 11px 18px; border-radius: 9px; color: #255945; font-weight: 700; }
+.secondary-button:hover { border-color: #198465; }
+.notice { border-radius: 9px; padding: 12px 15px; margin-bottom: 18px; background: #e8f3ed; color: #255945; }
+.notice.error { background: #fff0ed; color: #a03d2d; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 17px; }
+.section-heading span { color: #819087; font-size: 13px; }
+.metrics-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 28px; }
+.metric, .panel { background: #fff; border: 1px solid #e1e8e3; border-radius: 15px; box-shadow: 0 5px 20px #17382a08; }
+.metric { display: flex; flex-direction: column; min-height: 151px; padding: 23px; }
+.metric-label { font-size: 13px; color: #65776d; font-weight: 700; }
+.metric strong { font-family: 'Space Grotesk', sans-serif; font-size: clamp(27px, 3vw, 38px); line-height: 1.1; margin: 12px 0 7px; letter-spacing: -.05em; }
+.metric-detail { color: #819087; font-size: 12px; }
+.panel { padding: 25px; margin-bottom: 24px; }
+.provider-list { display: grid; gap: 0; }
+.provider-row { display: grid; grid-template-columns: 140px minmax(150px, 1fr); gap: 12px 20px; align-items: center; padding: 19px 0; border-top: 1px solid #edf1ed; }
+.provider-name { display: flex; gap: 10px; align-items: center; font-weight: 700; text-transform: capitalize; }
+.provider-dot { width: 8px; height: 8px; background: #27a57a; border-radius: 50%; }
+.provider-volume { height: 10px; background: #edf4ef; border-radius: 100px; overflow: hidden; }
+.bar { background: linear-gradient(90deg, #47bd8c, #197d61); height: 100%; border-radius: 100px; }
+.provider-stats { grid-column: 2; display: flex; flex-wrap: wrap; gap: 10px 27px; color: #708077; font-size: 12px; }
+.provider-stats b { color: #24372d; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; min-width: 790px; font-size: 13px; }
+th { text-align: left; color: #819087; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; padding: 12px 10px; border-bottom: 1px solid #dfe9e2; }
+td { padding: 16px 10px; border-bottom: 1px solid #edf1ed; }
+.status { display: inline-block; border-radius: 100px; padding: 5px 9px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.status.good { color: #137254; background: #e7f6ec; }
+.status.bad { color: #a24c3a; background: #fff0ed; }
+.empty { color: #819087; padding: 18px 0; margin: 0; }
+.pagination { display: flex; justify-content: space-between; align-items: center; color: #819087; font-size: 13px; padding-top: 20px; }
+.pagination div { display: flex; gap: 8px; }
+.pagination button { background: white; border: 1px solid #ccd8d0; border-radius: 8px; padding: 7px 11px; color: #345e4a; }
+.pagination button:disabled { opacity: .4; cursor: default; }
+footer { text-align: center; color: #91a098; padding: 24px; font-size: 12px; }
+@media (max-width: 850px) { .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .connect-panel { grid-template-columns: 1fr; } }
+@media (max-width: 580px) { .metrics-grid { grid-template-columns: 1fr; } .environment { display: none; } .provider-row { grid-template-columns: 1fr; } .provider-stats { grid-column: 1; } .section-heading { align-items: start; flex-direction: column; gap: 5px; } }
