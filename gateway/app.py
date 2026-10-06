@@ -17,8 +17,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from gateway.config import ModelAlias, load_model_aliases
 from gateway.providers.anthropic import AnthropicProvider
-from gateway.providers.base import FailureReason, GenerationOptions, Message, Provider, ProviderError
+from gateway.providers.base import FailureReason, GenerationOptions, Message, Provider
 from gateway.providers.openai import OpenAIProvider
+from gateway.routing import RetryPolicy, RouteFailure, generate_with_fallback
 
 
 logger = logging.getLogger(__name__)
@@ -91,10 +92,12 @@ def create_app(
     gateway_api_key: str | None = None,
     providers: Mapping[str, Provider] | None = None,
     model_aliases: Mapping[str, ModelAlias] | None = None,
+    retry_policy: RetryPolicy | None = None,
 ) -> FastAPI:
     configured_key = gateway_api_key if gateway_api_key is not None else os.getenv("GATEWAY_API_KEY", "")
     configured_key_hash = hashlib.sha256(configured_key.encode()).digest() if configured_key else None
     aliases = model_aliases if model_aliases is not None else load_model_aliases()
+    policy = retry_policy if retry_policy is not None else RetryPolicy.from_env()
     selected_providers = dict(providers) if providers is not None else {}
     if providers is None:
         if provider_key := os.getenv("OPENAI_API_KEY"):
@@ -172,17 +175,56 @@ def create_app(
         options = GenerationOptions(max_tokens=request.max_tokens, temperature=request.temperature)
         request_id = str(trace.request_id)
         try:
-            result = await selected_provider.generate(messages, model=model, options=options)
-        except ProviderError as exc:
-            raise HTTPException(status_code=502, detail={
-                "message": "Provider request failed", "request_id": request_id,
-                "initial_provider": provider_name, "final_provider": provider_name,
-                "retry_count": 0, "failure_reason": exc.reason,
-                "attempts": [AttemptResponse(provider=provider_name, model=model, failure_reason=exc.reason).model_dump()],
-            }) from exc
+            outcome = await generate_with_fallback(
+                initial_provider=provider_name,
+                alias=route,
+                providers=selected_providers,
+                messages=messages,
+                options=options,
+                policy=policy,
+                allow_fallback=request.provider is None,
+            )
+        except RouteFailure as exc:
+
+
+
+
+
+            raise HTTPException(
+                status_code=504 if exc.failure_reason == "deadline_exceeded" else 502,
+                detail={
+                    "message": (
+                        "Request deadline exceeded"
+                        if exc.failure_reason == "deadline_exceeded"
+                        else "Provider request failed"
+                    ),
+                    "request_id": request_id,
+                    "initial_provider": exc.initial_provider,
+                    "final_provider": exc.final_provider,
+                    "retry_count": exc.retry_count,
+                    "failure_reason": exc.failure_reason,
+                    "attempts": [
+                        AttemptResponse(
+                            provider=attempt.provider,
+                            model=attempt.model,
+                            failure_reason=attempt.failure_reason,
+                        ).model_dump()
+                        for attempt in exc.attempts
+                    ],
+                },
+            ) from exc
+        result = outcome.generation
+
+
+
+
+
+
+
+
         response = ChatResponse(
             request_id=request_id,
-            provider=provider_name,
+            provider=outcome.final_provider,
             model=result.model,
             text=result.text,
             finish_reason=result.finish_reason,
@@ -190,11 +232,18 @@ def create_app(
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
             ),
-            initial_provider=provider_name,
-            final_provider=provider_name,
-            retry_count=0,
-            failure_reason=None,
-            attempts=[AttemptResponse(provider=provider_name, model=model, failure_reason=None)],
+            initial_provider=outcome.initial_provider,
+            final_provider=outcome.final_provider,
+            retry_count=outcome.retry_count,
+            failure_reason=outcome.failure_reason,
+            attempts=[
+                AttemptResponse(
+                    provider=attempt.provider,
+                    model=attempt.model,
+                    failure_reason=attempt.failure_reason,
+                )
+                for attempt in outcome.attempts
+            ],
         )
         return response
 

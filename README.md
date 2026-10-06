@@ -18,3 +18,5 @@ Copy `.env.example` to `.env` and configure a gateway key, model aliases and pro
 ```
 
 `gateway.main` loads `.env` before app creation and overrides stale exported values. `POST /v1/chat` accepts a model alias, messages, generation parameters and an optional strict provider override. Callers use a bearer gateway key; provider keys are used by the adapters. Tests inject fake providers and never make paid calls.
+
+Transient timeouts, rate limits and server errors receive bounded exponential retries and compatible fallback. Explicit provider overrides stay on that provider. Authentication and invalid-request errors are not retried. The default provider-routing deadline is 45 seconds.
