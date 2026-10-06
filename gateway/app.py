@@ -6,7 +6,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Awaitable, Literal, Mapping, TypeVar
 from uuid import UUID, uuid4
@@ -20,8 +20,10 @@ from gateway.config import ModelAlias, load_model_aliases
 from gateway.providers.anthropic import AnthropicProvider
 from gateway.providers.base import FailureReason, GenerationOptions, Message, Provider
 from gateway.providers.openai import OpenAIProvider
+from gateway.pricing import PriceBook
 from gateway.redis_store import GatewayStore, RedisStore, make_cache_key
 from gateway.routing import RetryPolicy, RouteFailure, generate_with_fallback
+from gateway.telemetry import PostgresTelemetryRepository, RequestTelemetry, TelemetryRepository
 
 
 logger = logging.getLogger(__name__)
@@ -84,12 +86,6 @@ class ChatResponse(BaseModel):
     cache_hit: bool = False
 
 
-@dataclass
-class RequestContext:
-    request_id: UUID
-    gateway_key_id: str | None = None
-
-
 def create_app(
     *,
     gateway_api_key: str | None = None,
@@ -97,12 +93,20 @@ def create_app(
     model_aliases: Mapping[str, ModelAlias] | None = None,
     retry_policy: RetryPolicy | None = None,
     redis_store: GatewayStore | None = None,
+    price_book: PriceBook | None = None,
+    telemetry_repository: TelemetryRepository | None = None,
 ) -> FastAPI:
     configured_key = gateway_api_key if gateway_api_key is not None else os.getenv("GATEWAY_API_KEY", "")
     configured_key_hash = hashlib.sha256(configured_key.encode()).digest() if configured_key else None
     aliases = model_aliases if model_aliases is not None else load_model_aliases()
     policy = retry_policy if retry_policy is not None else RetryPolicy.from_env()
     store = redis_store if redis_store is not None else RedisStore.from_env()
+    prices = price_book if price_book is not None else PriceBook.from_env()
+    repository = (
+        telemetry_repository
+        if telemetry_repository is not None
+        else PostgresTelemetryRepository.from_env()
+    )
     selected_providers = dict(providers) if providers is not None else {}
     if providers is None:
         if provider_key := os.getenv("OPENAI_API_KEY"):
@@ -112,9 +116,13 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if isinstance(repository, PostgresTelemetryRepository):
+            await repository.open()
         try:
             yield
         finally:
+            if isinstance(repository, PostgresTelemetryRepository):
+                await repository.close()
             if isinstance(store, RedisStore) and redis_store is None:
                 await store.aclose()
             for provider in selected_providers.values():
@@ -124,19 +132,61 @@ def create_app(
     app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 
     @app.middleware("http")
-    async def identify_chat_request(http_request: Request, call_next):
+    async def record_chat_request(http_request: Request, call_next):
         if http_request.url.path != "/v1/chat" or http_request.method != "POST":
             return await call_next(http_request)
-        trace = RequestContext(request_id=uuid4())
+        trace = RequestTelemetry(request_id=uuid4(), price_version=prices.version)
         http_request.state.telemetry = trace
+        started = time.perf_counter()
+        response: Response | None = None
         try:
-            trace.gateway_key_id = await authenticate_gateway_key(http_request.headers.get("authorization"))
-        except HTTPException as exc:
-            response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
-        else:
-            response = await call_next(http_request)
-        response.headers["X-Request-ID"] = str(trace.request_id)
-        return response
+            try:
+                trace.gateway_key_id = await authenticate_gateway_key(
+                    http_request.headers.get("authorization")
+                )
+            except HTTPException as exc:
+                response = JSONResponse(
+                    status_code=exc.status_code,
+                    content={"detail": exc.detail},
+                    headers=exc.headers,
+                )
+            else:
+                response = await call_next(http_request)
+            trace.status_code = response.status_code
+            response.headers["X-Request-ID"] = str(trace.request_id)
+            return response
+        except Exception:
+            trace.status_code = 500
+            raise
+        finally:
+            trace.latency_ms = round((time.perf_counter() - started) * 1000, 3)
+            if trace.status_code == 200:
+                trace.outcome = "cache_hit" if trace.cache_hit else "success"
+            else:
+                trace.outcome = {
+                    401: "unauthorized",
+                    422: "invalid_request",
+                    429: "rate_limited",
+                    503: "unavailable",
+                    504: "timeout",
+                }.get(trace.status_code, "error")
+            if repository is None:
+                if response is not None:
+                    response.headers["X-Telemetry-Status"] = "disabled"
+            else:
+                try:
+                    async with asyncio.timeout(0.75):
+                        await repository.record(trace)
+                except Exception as exc:
+                    logger.warning(
+                        "PostgreSQL telemetry write failed for request %s: %s",
+                        trace.request_id, type(exc).__name__,
+                    )
+                    if response is not None:
+                        response.headers["X-Telemetry-Status"] = "failed"
+                else:
+                    if response is not None:
+                        response.headers["X-Telemetry-Status"] = "stored"
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -159,8 +209,8 @@ def create_app(
         http_request: Request,
         authorization: Annotated[str | None, Header()] = None,
     ) -> ChatResponse:
-        trace: RequestContext = http_request.state.telemetry
-
+        trace: RequestTelemetry = http_request.state.telemetry
+        trace.model_alias = request.model
         assert trace.gateway_key_id is not None
         try:
             allowed = await store.allow(trace.gateway_key_id)
@@ -178,9 +228,9 @@ def create_app(
         model = route.models.get(provider_name)
         if model is None:
             raise HTTPException(status_code=422, detail="Provider is not configured for this alias")
-
-
-
+        trace.initial_provider = provider_name
+        trace.final_provider = provider_name
+        trace.actual_model = model
         selected_provider = selected_providers.get(provider_name)
         if selected_provider is None:
             raise HTTPException(status_code=503, detail="Provider is not configured")
@@ -207,11 +257,11 @@ def create_app(
                     except ValidationError:
                         logger.warning("Ignoring invalid cached chat response")
                     else:
-
-
-
-
-
+                        trace.cache_hit = True
+                        trace.actual_model = cached_response.model
+                        trace.input_tokens = 0
+                        trace.output_tokens = 0
+                        trace.estimated_cost_usd = Decimal("0")
                         return cached_response.model_copy(update={
                             "request_id": str(trace.request_id),
                             "cache_hit": True,
@@ -231,11 +281,11 @@ def create_app(
                 allow_fallback=request.provider is None,
             )
         except RouteFailure as exc:
-
-
-
-
-
+            trace.final_provider = exc.final_provider
+            trace.actual_model = route.models.get(exc.final_provider)
+            trace.retry_count = exc.retry_count
+            trace.failure_reason = exc.failure_reason
+            trace.attempts = exc.attempts
             raise HTTPException(
                 status_code=504 if exc.failure_reason == "deadline_exceeded" else 502,
                 detail={
@@ -260,14 +310,19 @@ def create_app(
                 },
             ) from exc
         result = outcome.generation
-
-
-
-
-
-
-
-
+        trace.final_provider = outcome.final_provider
+        trace.actual_model = result.model
+        trace.input_tokens = result.usage.input_tokens
+        trace.output_tokens = result.usage.output_tokens
+        trace.retry_count = outcome.retry_count
+        trace.failure_reason = outcome.failure_reason
+        trace.attempts = outcome.attempts
+        trace.estimated_cost_usd = prices.estimate(
+            outcome.final_provider,
+            result.model,
+            result.usage.input_tokens,
+            result.usage.output_tokens,
+        )
         response = ChatResponse(
             request_id=request_id,
             provider=outcome.final_provider,

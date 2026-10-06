@@ -22,3 +22,11 @@ Copy `.env.example` to `.env` and configure a gateway key, model aliases and pro
 Transient timeouts, rate limits and server errors receive bounded exponential retries and compatible fallback. Explicit provider overrides stay on that provider. Authentication and invalid-request errors are not retried. The default provider-routing deadline is 45 seconds.
 
 Redis is required for per-key rate limiting. The rate limit runs before cache lookup. Caching is opt-in, requires temperature zero and a final user message, and isolates keys/providers/models/messages/generation options. Redis rate-limit failures return 503; cache-only errors bypass caching. Configure `REDIS_URL`, the rate window/threshold and cache TTL in `.env`.
+
+## Telemetry and pricing
+
+Configure `DATABASE_URL` and apply `migrations/001_request_telemetry.sql` with `psql -v ON_ERROR_STOP=1`. PostgreSQL records request metadata, token usage, route attempts and estimated USD cost without prompts, response bodies or credentials. Each request reports telemetry status in `X-Telemetry-Status`. Writes are best effort with no durable replay queue.
+
+`prices.json` and `prices.example.json` contain numeric test-only rates; `prices.live.json` contains versioned standard text-token rates for the configured live IDs. Configure `GATEWAY_PRICE_CONFIG_PATH` to select a file. Estimates exclude provider prompt-cache adjustments and taxes.
+
+Run real-service checks by setting `TEST_DATABASE_URL` and `TEST_REDIS_URL` before `.venv/bin/python -m pytest -q`. These tests remove only their random fixture rows and Redis keys.

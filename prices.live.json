@@ -1,0 +1,26 @@
+{
+  "version": "official-standard-text-2026-10-03",
+  "note": "Verified 2026-10-03 against official OpenAI and Anthropic model pages. USD per million standard text tokens; estimates exclude provider-side prompt-cache discounts and taxes. Recheck before relying on estimates for billing.",
+  "models": {
+    "openai": {
+      "gpt-4.1-mini-2025-04-14": {
+        "input_per_million_usd": "0.40",
+        "output_per_million_usd": "1.60"
+      },
+      "gpt-4.1-2025-04-14": {
+        "input_per_million_usd": "2.00",
+        "output_per_million_usd": "8.00"
+      }
+    },
+    "anthropic": {
+      "claude-haiku-4-5-20251001": {
+        "input_per_million_usd": "1.00",
+        "output_per_million_usd": "5.00"
+      },
+      "claude-sonnet-4-6": {
+        "input_per_million_usd": "3.00",
+        "output_per_million_usd": "15.00"
+      }
+    }
+  }
+}
