@@ -160,5 +160,14 @@ npm test
 npm run build
 ```
 
+The PostgreSQL and Redis integration tests use random gateway keys, verify their own rows, managed-key lifecycle, per-key analytics/cache isolation, rate limiting before cache hits, and real cache expiry, and remove only their fixture data afterward. The outage regression tests use unavailable local endpoints to verify Redis fails closed and PostgreSQL write failures return `X-Telemetry-Status: failed`; analytics and managed-key lookup return 503 during a database outage. No real provider is called by the tests. The latest local results and verification limits are recorded in [FINAL_VERIFICATION.md](FINAL_VERIFICATION.md). For the 40-request local load check, return to the repository root and run:
 
-The fake-provider load workload and final verification results are added with the verification tooling.
+```sh
+TEST_DATABASE_URL=postgresql://gateway:gateway-dev-password@127.0.0.1:5433/gateway \
+TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
+  .venv/bin/python scripts/load_test.py
+```
+
+The load script uses an in-process ASGI HTTP client, fake providers, a random key, and five concurrent requests at peak; Redis and PostgreSQL are real. It warms ten cache entries, repeats those ten requests, sends sixteen unique requests, and sends four requests whose first fake provider fails transiently and whose second fake provider recovers. It verifies all 40 PostgreSQL rows before removing its own rows and Redis keys. In a local run after these fixes, the 40 requests completed in 0.285 seconds (140.17 requests/s), with response p50 14.326 ms, p95 25.171 ms, 0% HTTP errors, 25% cache hits, and 4/4 fallback recoveries. The p50 and p95 use the nearest-rank method. These are measured fixture results from this machine, not provider latency or network-hosted throughput.
+
+Remaining scope: the MVP has one configured management key; it has no separate administrator roles, key rotation API, or key-creation audit log. Provider credentials and live model IDs remain configuration. No cloud deployment or paid-provider load test was performed.
