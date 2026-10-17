@@ -1,173 +1,178 @@
-# LLM Gateway — local MVP
+# LLM Gateway
 
-This service implements the gateway, Redis cache and rate limit, PostgreSQL telemetry, React analytics dashboard, and gateway key management from `LLM_Gateway_MVP.txt`. The Compose stack is for local use; no deployment is included.
+## Overview and problem solved
 
-## Quick start with the existing local containers
+Applications that call multiple LLM providers need to handle different request
+formats, credentials, failures, and usage reports. LLM Gateway puts those
+concerns behind one authenticated chat API for OpenAI and Anthropic.
 
-The current `gateway-redis` and `gateway-postgres` containers use host ports 6379 and 5433. Leave them and their volumes in place. If they are stopped, start them with `docker start gateway-redis gateway-postgres`. From the repository root, run:
+Clients select a model alias such as `fast` or `smart`. The gateway routes the
+request, limits usage, optionally reuses a cached response, and records token,
+latency, and estimated cost data for a React dashboard. This is a local MVP,
+with an emphasis on bounded failure handling and visibility into each request.
 
-```sh
-docker exec gateway-postgres pg_isready -U gateway -d gateway
-docker exec -i gateway-postgres psql -v ON_ERROR_STOP=1 -U gateway -d gateway < migrations/001_request_telemetry.sql
-docker exec -i gateway-postgres psql -v ON_ERROR_STOP=1 -U gateway -d gateway < migrations/002_gateway_keys.sql
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -e '.[test]'
-.venv/bin/uvicorn gateway.main:app --host 127.0.0.1 --port 8000
-```
+## Tech stack
 
-Keep the API terminal open. In a second terminal, from the repository root:
+- **Backend:** Python 3.11+, FastAPI, Pydantic, HTTPX, and Uvicorn.
+- **Storage:** Redis for rate counters/cache; PostgreSQL with Psycopg for telemetry
+  and managed-key records. Schema changes use transactional SQL migrations.
+- **Frontend:** React 19 and Vite 8, with authenticated analytics through a proxy.
+- **Tooling:** Docker Compose, pytest, and Node's built-in test runner.
 
-```sh
-cd dashboard
-npm ci
-npm run dev
-```
+## Main features
 
-Open `http://127.0.0.1:5173` and enter the `GATEWAY_API_KEY` value from your existing `.env`. `gateway.main` loads `.env` before creating the API, so its values override stale exports in the launching shell. The dashboard uses the Vite proxy to reach the API at port 8000. These commands do not call a provider by themselves. If the API or dashboard is already running on these ports, restart an older `gateway.app:app` process to pick up this entrypoint and current configuration.
+- `POST /v1/chat` normalizes provider requests and responses, with configurable
+  aliases, usage reporting, request IDs, and attempt metadata.
+- Bounded retries and provider fallback handle transient failures; an explicit
+  provider override keeps a request on the chosen provider.
+- Per-key rate limits and opt-in caching control repeated provider work.
+- PostgreSQL telemetry powers request counts, success/cache-hit rates, tokens,
+  estimated USD cost, mean/p95 latency, and provider breakdowns.
+- The dashboard supports 1-hour, 24-hour, 7-day, and 30-day windows, with 25-row
+  request-history pages. Changing the window resets pagination.
+- Protected `/api-keys` endpoints create, list, and revoke managed gateway keys.
 
-## Isolated Docker Compose startup
-
-For a new checkout, copy `.env.example` to `.env` and fill in a gateway key and the model alias configuration. Keep an existing `.env` unchanged. Then run from the repository root:
-
-```sh
-docker compose -f compose.yaml up --build -d
-docker compose -f compose.yaml ps
-```
-
-Open `http://127.0.0.1:5174`. The Compose API is at port 8001, PostgreSQL at 5434, and Redis at 6380. This stack uses its own PostgreSQL volume and applies both SQL migrations in filename order before starting the API, so it does not replace or change the existing containers on ports 5433 and 6379. It reads `.env` for the gateway and provider configuration while overriding the database, Redis, and price-file paths inside the containers. The image includes `prices.live.json`, and Compose selects that file so the documented live model IDs have price estimates. Stop only this stack with `docker compose -f compose.yaml stop`; its containers and database volume remain available for the next `up`.
+## Architecture
 
 ```mermaid
 flowchart LR
-    Browser[React dashboard] -->|Bearer gateway key| API[FastAPI analytics]
-    Client[Chat client] -->|POST /v1/chat| Gateway[FastAPI auth and rate limit]
-    Gateway --> Redis[(Redis rate counters and opt-in cache)]
-    Gateway --> Router[Retry and fallback router]
+    Client[Chat client] -->|Bearer gateway key| API[FastAPI gateway]
+    API --> Redis[(Redis: rate limits and cache)]
+    API --> Router[Retry and fallback router]
     Router --> OpenAI[OpenAI adapter]
     Router --> Anthropic[Anthropic adapter]
-    Gateway --> Telemetry[(PostgreSQL request telemetry)]
-    API --> Telemetry
+    API --> Postgres[(PostgreSQL: telemetry and key hashes)]
+    Dashboard[React dashboard] -->|Authenticated analytics| API
 ```
 
-## Run locally
+A chat request passes through authentication, body validation, rate limiting,
+cache lookup, and provider routing. A cache hit skips the provider. The telemetry
+middleware records the outcome, including rejected and failed chat requests.
+The dashboard reads `/analytics/summary`, `/analytics/providers`, and `/requests`;
+each endpoint scopes results to the authenticated key.
 
-Python 3.11 or newer is required. These commands use Python 3.12, which was used for the test run:
+## Key design decisions
+
+### Separate gateway access from provider credentials
+
+`GATEWAY_API_KEY` authenticates gateway clients and acts as the management key.
+`OPENAI_API_KEY` and `ANTHROPIC_API_KEY` authenticate the adapters upstream.
+Managed keys can use chat and their own analytics, but cannot manage other keys.
+New managed secrets are returned once; PostgreSQL stores SHA-256 hashes.
+Revocation takes effect at the next authentication check. The dashboard keeps
+its key in page memory rather than a URL or browser storage.
+
+### Retry only failures that may recover
+
+Only provider timeouts, HTTP 429, and HTTP 5xx trigger retries. Authentication,
+malformed-request, and other nontransient errors stop without fallback. The
+default is two additional attempts per provider with exponential backoff;
+fallback requires the second provider's model mapping and credential.
+An explicit `provider` disables fallback while allowing retries there.
+
+A default **45-second routing deadline** covers all provider calls and backoff.
+Expiry cancels the in-flight call and prevents further attempts. Initial/final
+providers, retry count, safe failure reasons, and attempt paths make recovery
+visible. The deadline does not cover the entire HTTP lifecycle.
+
+### Apply rate limits before caching
+
+Redis atomically counts requests per key in a fixed window: the default is
+60 requests per 60 seconds, including cache hits. Exceeding it returns 429.
+Redis failure at this step returns 503 before any provider call; a later
+cache-only failure lets an allowed request proceed without caching.
+
+Caching requires `cache: true`, explicit `temperature: 0`, and a final user
+message. Only success without retries or fallback is stored, for 60 seconds by
+default. The fingerprint includes the gateway key identifier, selected provider,
+configured model ID, messages, and generation parameters. A hit makes no provider
+call and receives a new request ID. Chat repeats cached usage for compatibility;
+telemetry records zero new provider tokens and cost. Redis cache values contain
+response text until expiry, although key names contain only a hash.
+
+### Keep telemetry useful without retaining conversations
+
+PostgreSQL records request IDs, key identifiers, model/provider routing, tokens,
+latency, outcome, attempts, cache hits, price version, and estimated cost. It
+stores no raw messages, response text, API keys, or authorization headers.
+Analytics also excludes key hashes. Valid-key malformed requests retain their
+key scope because authentication runs before body validation.
+
+Telemetry writes have a 750 ms budget. `X-Telemetry-Status` reports `stored`,
+`failed`, or `disabled`; failures log the request ID and exception type while
+preserving the chat result. This trades guaranteed accounting for availability:
+there is no durable replay, so dashboard totals can be incomplete.
+
+### Make pricing explicit and versioned
+
+Costs use the final provider's reported usage and **returned model ID**, with
+USD-per-million-token rates and decimal arithmetic. Compose selects
+`prices.live.json`, a bundled rate snapshot with version
+`official-standard-text-2026-10-03`; recheck rates before billing decisions.
+`prices.json` and `prices.example.json` are **test pricing only**. Missing rates
+yield null cost and an unpriced-success count, not free usage. Invalid configured
+prices fail startup. Stored estimates are not recalculated when rates change.
+
+## Testing and verified results
+
+Tests cover authentication/revocation, malformed input, retry/fallback paths,
+strict overrides, deadlines, cache isolation/expiry, rate limiting, private
+telemetry, known-row analytics, and dependency failures. Provider responses in
+the automated suite are fake; no paid calls are needed.
+
+Checks without service URLs pass **64 backend tests**, with **5 integration
+tests skipped**; **3 frontend tests** also pass. Recorded full-service verification
+passed **69 backend tests** with real Redis/PostgreSQL, and the dashboard
+production build succeeded. The full-service result is recorded evidence; it
+does not establish current provider availability or production readiness.
+
+The fake-provider load script sends 40 requests at peak concurrency 5: ten cache
+warm-ups, ten repeats, sixteen unique requests, and four fallback cases. A
+recorded run verified all 40 telemetry rows, zero HTTP errors, ten cache hits,
+and four successful fallbacks. It measured 0.273 seconds overall and 23.855 ms
+p95 response latency, with USD 0.000510 in **fixture-priced** estimated usage.
+These are **in-process ASGI measurements with simulated providers**, not
+live-provider latency, billed cost, or production HTTP throughput.
+
+To run checks from the repository root, use Python 3.11+ (commands use 3.12),
+Node.js 22.12+, and npm:
 
 ```sh
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m pytest -q
+(cd dashboard && npm ci && npm test && npm run build)
 ```
 
-Set the variables shown in `.env.example` with the credentials and model IDs for your environment. `GATEWAY_API_KEY` authenticates callers to this service. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` authenticate the service to their respective providers. Start with `gateway.main:app`: it loads `.env` before app creation and gives file values precedence over exported shell variables. Set `GATEWAY_ENV_FILE` to use a different file. In Compose, `.env` is excluded from the image and Compose injects its values into the container environment. The legacy `gateway.app:app --env-file .env` command may keep stale exported values because Uvicorn does not override them.
-
-Run Redis and set `REDIS_URL` to its connection URL (default `redis://localhost:6379/0`). Every authenticated chat request needs Redis for rate limiting. `GATEWAY_RATE_LIMIT` defaults to 60 requests per key in a `GATEWAY_RATE_WINDOW_SECONDS` window of 60 seconds. This is a fixed window starting with the first request. Cache entries expire after `GATEWAY_CACHE_TTL_SECONDS`, which defaults to 60 seconds.
-
-For local PostgreSQL, leave the existing Redis container on port 6379 and use host port 5433 for PostgreSQL:
+Service tests skip unless test URLs are supplied. With Compose running and its
+migrations complete, run the full backend suite against disposable local data:
 
 ```sh
-docker run -d --name gateway-postgres \
-  -e POSTGRES_USER=gateway -e POSTGRES_PASSWORD=gateway-dev-password \
-  -e POSTGRES_DB=gateway -p 127.0.0.1:5433:5432 \
-  -v gateway_pgdata:/var/lib/postgresql/data postgres:16
-docker exec gateway-postgres pg_isready -U gateway -d gateway
+export TEST_DATABASE_URL=postgresql://gateway:gateway-dev-password@127.0.0.1:5434/gateway
+export TEST_REDIS_URL=redis://127.0.0.1:6380/0
+.venv/bin/python -m pytest -q
+.venv/bin/python scripts/load_test.py
 ```
 
-If the `gateway-postgres` container already exists but is stopped, use `docker start gateway-postgres` instead of `docker run`. Keep the existing `gateway-redis` container running.
+Integration tests and the load script create random fixture keys/rows and remove
+their own data. Frontend helper tests/builds do not verify interactive browser
+behavior. Live-provider availability, billing, and deployment need separate checks.
 
-Once `pg_isready` reports that PostgreSQL accepts connections, apply both migrations in order:
+## Known limitations
 
-```sh
-docker exec -i gateway-postgres psql -v ON_ERROR_STOP=1 -U gateway -d gateway < migrations/001_request_telemetry.sql
-docker exec -i gateway-postgres psql -v ON_ERROR_STOP=1 -U gateway -d gateway < migrations/002_gateway_keys.sql
-```
+- Local development stack only: the dashboard uses Vite's development server;
+  there is no cloud deployment or production security configuration.
+- Text-only, nonstreaming chat; no separate administrator roles, key-rotation API,
+  or key-creation audit log. The configured management key rotates via config.
+- Best-effort telemetry has no durable queue/replay. Database outages make
+  analytics, management, and managed-key authentication unavailable (503).
+- `/health` checks liveness only. Authentication, Redis, and telemetry have
+  separate time bounds outside the provider-routing deadline.
+- Cost estimates exclude provider prompt-cache billing adjustments, taxes, and
+  unreported usage from failed attempts. Null estimates are omitted from totals.
+- Cache repeatability is a policy, not a guarantee of deterministic model output.
+  Offset pagination can shift if new requests arrive between page reads.
 
-Set `DATABASE_URL=postgresql://gateway:gateway-dev-password@localhost:5433/gateway` before starting the app. Both SQL migrations are transactional and can be run again safely. Check the saved telemetry rows with:
+## Author
 
-```sh
-docker exec -it gateway-postgres psql -U gateway -d gateway \
-  -c 'SELECT request_id, model_alias, final_provider, input_tokens, output_tokens, estimated_cost_usd, outcome, cache_hit FROM request_telemetry ORDER BY created_at DESC LIMIT 10;'
-```
-
-For local dashboard testing, `prices.json` and `prices.example.json` contain **test pricing only**: numeric USD-per-million-token fixture rates and version `local-test-pricing-v1`. These are not provider prices or billing rates. `prices.live.json` contains standard text-token rates verified on 2026-10-03 from the [OpenAI GPT-4.1 mini](https://developers.openai.com/api/docs/models/gpt-4.1-mini), [OpenAI GPT-4.1](https://developers.openai.com/api/docs/models/gpt-4.1), [Claude Haiku 4.5](https://platform.claude.com/docs/en/models/haiku-4-5/overview), and [Claude Sonnet 4.6](https://platform.claude.com/docs/en/models/sonnet-4-6/overview) model pages. Both the existing local `.env` and the isolated Compose stack select this live price file. If your `GATEWAY_MODEL_ALIASES` uses different actual model IDs, update the selected price file to match; otherwise requests still work but their estimated cost is null. Prices are estimates and exclude provider-side prompt-cache discounts and taxes. Recheck official rates before relying on them for billing. Each input and output rate must be a nonnegative number or numeric string. An invalid configured price file prevents API startup. With no price file configured, requests work but `estimated_cost_usd` is null and `price_version` is `unconfigured`.
-
-`GATEWAY_MODEL_ALIASES` is a JSON object. Each alias has a `default_provider` and a `models` map containing the provider-specific model IDs allowed for that alias. Both `fast` and `smart` must be configured. The provider override works only when the selected alias includes a model for that provider. Provider keys can be omitted if that provider is not used. A fallback requires both a model mapping and a credential for the second provider.
-
-For live local use, `.env.example` and the existing `.env` map `fast` to pinned `gpt-4.1-mini-2025-04-14` and `claude-haiku-4-5-20251001`, and `smart` to pinned `gpt-4.1-2025-04-14` and `claude-sonnet-4-6`. To enable both adapters, fill in only `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` with active API credentials in `.env`; keep `GATEWAY_API_KEY` as the existing caller credential. The existing `REDIS_URL`, `DATABASE_URL`, model aliases, and `GATEWAY_PRICE_CONFIG_PATH=prices.live.json` are configured for the local containers. Restart the API after changing `.env`; `gateway.main:app` loads it at process startup. A provider may still require account credit, model access, or a higher usage tier. The gateway intentionally returns a safe provider error without exposing the upstream error body or credentials.
-
-## Gateway key management
-
-The existing `GATEWAY_API_KEY` in `.env` remains the bootstrap management key and continues to work for chat and its own analytics. Only this configured key may create, list, or revoke managed keys. Managed keys can call `/v1/chat` and view only their own analytics; their calls to `/api-keys` return HTTP 403. Invalid or revoked keys return HTTP 401. PostgreSQL is required for managed keys and key management: when it is unavailable, managed-key authentication and management return HTTP 503, while the configured key still authenticates. Apply `002_gateway_keys.sql` before using these endpoints.
-
-With `GATEWAY_API_KEY` available in your shell, create, list, or revoke a key using the API port for your setup (8000 for the existing local API, 8001 for Compose):
-
-```sh
-curl -X POST http://127.0.0.1:8000/api-keys \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"local-client"}'
-curl http://127.0.0.1:8000/api-keys \
-  -H "Authorization: Bearer $GATEWAY_API_KEY"
-curl -X DELETE http://127.0.0.1:8000/api-keys/KEY_ID_FROM_LIST \
-  -H "Authorization: Bearer $GATEWAY_API_KEY"
-```
-
-The `POST` response contains a random `gw_...` bearer key **once**; save it securely at creation. `GET` and `DELETE` return only the key's UUID, name, creation time, and revocation time. Repeating `DELETE` for the same UUID returns its original revocation time; an unknown UUID returns 404. The `gateway_keys` table holds only a SHA-256 hash of each managed key, its UUID, name, and timestamps. Neither analytics responses nor application log messages contain raw keys or key hashes. Each authenticated key has its own Redis rate-limit counter, cache namespace, and telemetry scope. A revoked key loses access on its next authentication check; existing telemetry remains in PostgreSQL for audit and is no longer accessible with that revoked key. The configured management key is controlled only by `.env`, so rotating it is a configuration and restart operation.
-
-`GATEWAY_MAX_RETRIES` defaults to 2 and accepts 0–5 additional attempts per provider. `GATEWAY_RETRY_BASE_DELAY_SECONDS` defaults to 0.1 and accepts 0–5 seconds. Retry delays double after each failed attempt. Each provider HTTP client uses a 30-second inactivity timeout. `GATEWAY_REQUEST_DEADLINE_SECONDS` defaults to 45 and accepts a value greater than 0 and at most 60 seconds. This wall-clock deadline covers all provider calls and retry waits for one chat request.
-
-Start the service with `.venv/bin/uvicorn gateway.main:app --host 127.0.0.1 --port 8000`. Example request:
-
-```sh
-curl -X POST http://127.0.0.1:8000/v1/chat \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"fast","messages":[{"role":"user","content":"Say hello"}],"max_tokens":128,"temperature":0,"cache":true}'
-```
-
-The same request can select Anthropic by adding `"provider":"anthropic"` when `fast` has an Anthropic model mapping. The request accepts `model` (alias), `messages`, optional `max_tokens` (default 1024), optional `temperature` (0–1), optional `provider` override, and optional `cache` (default false). Messages have `system`, `user`, or `assistant` roles; system messages must come first. The response contains a request ID, selected provider, actual model, text, normalized finish reason, input/output token usage, `initial_provider`, `final_provider`, `retry_count`, `failure_reason`, an `attempts` list, and `cache_hit`.
-
-Rate limiting runs before cache lookup, so cache hits count toward the key's limit. The next request after the configured threshold returns HTTP 429. Caching is used only when `cache` is true, `temperature` is explicitly zero, the final message is from the user, and the provider succeeds without retry or fallback. Other requests run normally without caching. Cache keys include the caller key hash, selected provider, configured provider model ID, messages, and generation parameters; the key itself is hashed so prompts are not visible in Redis key names. A cache hit returns a new request ID with `cache_hit: true` and an empty `attempts` list, without calling a provider. An eligible success stores its response text and metadata in Redis for the configured TTL; ordinary requests do not store prompt or response bodies.
-
-Only provider timeouts, HTTP 429, and HTTP 5xx are retried. Without an explicit provider override, a configured second provider gets its own bounded retry sequence after the first provider exhausts its retries. Setting `provider` pins the request to that provider: eligible failures can still retry there, but cannot call the other provider. Other errors stop immediately. `retry_count` counts repeated calls to a provider that actually start; the first fallback call is a new attempt, so it does not add to that count. On a recovered response, `failure_reason` is the last transient reason; on a final failure, it is the terminal reason. Each `attempts` entry records the provider, model, and a safe reason code or `null` for success. Failed requests return the same route metadata in the HTTP 502 `detail` object. If the deadline expires, the in-flight provider call is cancelled and the service returns HTTP 504 with `failure_reason: "deadline_exceeded"`; no further attempt starts.
-
-Each `POST /v1/chat` authenticates before body validation and gets an `X-Request-ID` response header. A valid key on a malformed request is therefore retained in its telemetry row, while a missing or invalid key returns 401 even with a malformed body. PostgreSQL rows include the authenticated key identifier (SHA-256), model alias when validation succeeds, initial and final provider, actual model, reported token counts, latency, status, outcome, retry count, failure reason, cache hit, attempt metadata, price version, and estimated USD cost. The table has a timestamp; it contains no raw messages, response text, API keys, or authorization headers. The price estimate uses the final provider's reported input and output tokens and the configured rates. It may differ from provider billing, especially if a failed attempt consumed unreported tokens. On a cache hit, the response repeats the cached usage for compatibility, while the new telemetry row records zero provider tokens and zero incremental cost. On failures with no reported usage, token counts and cost are null.
-
-Every chat response includes `X-Telemetry-Status: stored`, `failed`, or `disabled`. `disabled` means `DATABASE_URL` is unset. If PostgreSQL is temporarily unavailable or a write exceeds 750 ms, the gateway logs a warning with the request ID and exception type, sets `failed`, and still returns the chat result. This is best-effort telemetry: there is no durable queue or replay, so a failed write can permanently lose that row and make dashboard totals incomplete. An unexpected server exception may have no response header; check server logs in that case. Apply both migrations before enabling PostgreSQL telemetry.
-
-## Analytics dashboard
-
-The authenticated `GET /analytics/summary`, `GET /analytics/providers`, and `GET /requests` endpoints read PostgreSQL telemetry for the authenticated gateway key only. Each accepts `window=1h|24h|7d|30d` (default `24h`). `/requests` also accepts `limit` (1–100, default 25) and `offset` (default 0). Summary and provider results include request, success, error and cache-hit counts and rates; input/output token totals; estimated USD cost; unpriced successful request count; and mean/p95 latency. The provider breakdown groups by final provider, with `unrouted` for requests that never selected one. Rates use all authenticated requests in the selected window as the denominator. Cache hits contribute zero new tokens and cost. History contains selected request metadata only. None of these responses includes gateway key hashes, API keys, raw messages, or response text. Analytics reads return HTTP 503 when PostgreSQL is not configured or available.
-
-Start the API with `GATEWAY_API_KEY` and `DATABASE_URL` set, along with the existing Redis and optional provider configuration. In a second terminal, use Node.js 22.12 or newer:
-
-```sh
-cd dashboard
-npm ci
-npm run dev
-```
-
-Open `http://127.0.0.1:5173` and enter the configured `GATEWAY_API_KEY` or an active managed gateway key. You can paste the configured value alone or its complete `GATEWAY_API_KEY=...` line from `.env`; surrounding quotes are removed. Do not use `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. The dashboard checks authentication before loading the three views. It keeps the key in page memory and sends it in the `Authorization` header; it does not place the key in a URL or browser storage. If an older dashboard tab holds an incorrect key, click **Disconnect** and reconnect. The Vite development server proxies `/analytics` and `/requests` to the API at `127.0.0.1:8000`, so both servers must be running. `npm test` checks key-input handling and `npm run build` checks the frontend production build. If no requests were made with the authenticated key, the dashboard shows an empty window.
-
-`/health` is available without authentication. An invalid gateway key returns 401; invalid input or alias returns 422; missing provider configuration returns 503. Provider failures return 502, including provider credential failures, and the overall deadline returns 504. If Redis is unavailable when the rate-limit check runs, the service returns HTTP 503 before cache lookup or any provider call. This protects the provider budget. If a cache read or write fails after a successful rate-limit check, the request proceeds without caching. Redis connects lazily, so `/health` can still respond while Redis is unavailable.
-
-Run `.venv/bin/python -m pytest -q` for the dependency-free checks; the live-service tests skip unless `TEST_DATABASE_URL` and `TEST_REDIS_URL` are set. To run the full suite against the existing local containers with fake providers:
-
-```sh
-TEST_DATABASE_URL=postgresql://gateway:gateway-dev-password@127.0.0.1:5433/gateway \
-TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
-  .venv/bin/python -m pytest -q
-cd dashboard
-npm test
-npm run build
-```
-
-The PostgreSQL and Redis integration tests use random gateway keys, verify their own rows, managed-key lifecycle, per-key analytics/cache isolation, rate limiting before cache hits, and real cache expiry, and remove only their fixture data afterward. The outage regression tests use unavailable local endpoints to verify Redis fails closed and PostgreSQL write failures return `X-Telemetry-Status: failed`; analytics and managed-key lookup return 503 during a database outage. No real provider is called by the tests. The latest local results and verification limits are recorded in [FINAL_VERIFICATION.md](FINAL_VERIFICATION.md). For the 40-request local load check, return to the repository root and run:
-
-```sh
-TEST_DATABASE_URL=postgresql://gateway:gateway-dev-password@127.0.0.1:5433/gateway \
-TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
-  .venv/bin/python scripts/load_test.py
-```
-
-The load script uses an in-process ASGI HTTP client, fake providers, a random key, and five concurrent requests at peak; Redis and PostgreSQL are real. It warms ten cache entries, repeats those ten requests, sends sixteen unique requests, and sends four requests whose first fake provider fails transiently and whose second fake provider recovers. It verifies all 40 PostgreSQL rows before removing its own rows and Redis keys. In a local run after these fixes, the 40 requests completed in 0.285 seconds (140.17 requests/s), with response p50 14.326 ms, p95 25.171 ms, 0% HTTP errors, 25% cache hits, and 4/4 fallback recoveries. The p50 and p95 use the nearest-rank method. These are measured fixture results from this machine, not provider latency or network-hosted throughput.
-
-Remaining scope: the MVP has one configured management key; it has no separate administrator roles, key rotation API, or key-creation audit log. Provider credentials and live model IDs remain configuration. No cloud deployment or paid-provider load test was performed.
+Mohib Zaidi
