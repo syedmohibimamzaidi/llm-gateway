@@ -13,11 +13,14 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from redis.exceptions import RedisError
 
 from gateway.analytics import AnalyticsRepository, PostgresAnalyticsRepository, window_bounds
 from gateway.config import ModelAlias, load_model_aliases
+from gateway.deployment import Deployment
+from gateway.safety import IngressGuard, MemorySafetyStore, RedisSafetyStore, SafetyPolicy, SafetyStore
 from gateway.keys import KeyRecord, KeyRepository, PostgresKeyRepository
 from gateway.providers.anthropic import AnthropicProvider
 from gateway.providers.base import FailureReason, GenerationOptions, Message, Provider
@@ -36,15 +39,15 @@ class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: str = Field(pattern="^(system|user|assistant)$")
-    content: str = Field(min_length=1)
+    content: str = Field(min_length=1, max_length=16000)
 
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str = Field(min_length=1)
-    messages: list[ChatMessage] = Field(min_length=1)
-    max_tokens: int = Field(default=1024, ge=1)
+    model: str = Field(min_length=1, max_length=100)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=64)
+    max_tokens: int = Field(default=1024, ge=1, le=4096)
     temperature: float | None = Field(default=None, ge=0, le=1)
     provider: Literal["openai", "anthropic"] | None = None
     cache: bool = False
@@ -115,7 +118,11 @@ def create_app(
     telemetry_repository: TelemetryRepository | None = None,
     analytics_repository: AnalyticsRepository | None = None,
     key_repository: KeyRepository | None = None,
+    safety_policy: SafetyPolicy | None = None,
+    safety_store: SafetyStore | None = None,
 ) -> FastAPI:
+    deployment = Deployment.from_env()
+    safety = safety_policy if safety_policy is not None else SafetyPolicy.from_env()
     configured_key = gateway_api_key if gateway_api_key is not None else os.getenv("GATEWAY_API_KEY", "")
     configured_key_hash = hashlib.sha256(configured_key.encode()).digest() if configured_key else None
     aliases = model_aliases if model_aliases is not None else load_model_aliases()
@@ -142,6 +149,18 @@ def create_app(
         if provider_key := os.getenv("ANTHROPIC_API_KEY"):
             selected_providers["anthropic"] = AnthropicProvider(api_key=provider_key)
 
+    deployment.validate(
+        key=configured_key, aliases=aliases, providers=selected_providers, prices=prices,
+        database_url=os.getenv("DATABASE_URL"), redis_url=os.getenv("REDIS_URL"),
+    )
+    if deployment.production and not isinstance(store, RedisStore):
+        if safety_store is None:
+            raise ValueError("Production requires distributed admission control")
+    admission = safety_store or (
+        RedisSafetyStore(store.client, safety) if deployment.production and isinstance(store, RedisStore)
+        else MemorySafetyStore(safety)
+    )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if isinstance(repository, PostgresTelemetryRepository):
@@ -157,7 +176,12 @@ def create_app(
                 if isinstance(provider, (OpenAIProvider, AnthropicProvider)):
                     await provider.aclose()
 
-    app = FastAPI(title="LLM Gateway", lifespan=lifespan)
+    app = FastAPI(
+        title="LLM Gateway", lifespan=lifespan,
+        docs_url=None if deployment.production else "/docs",
+        redoc_url=None if deployment.production else "/redoc",
+        openapi_url=None if deployment.production else "/openapi.json",
+    )
 
     @app.middleware("http")
     async def record_chat_request(http_request: Request, call_next):
@@ -220,11 +244,36 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    readiness_lock = asyncio.Lock()
+    readiness_at, readiness_ok = 0.0, False
+
+    @app.get("/readyz")
+    async def ready() -> JSONResponse:
+        nonlocal readiness_at, readiness_ok
+        async with readiness_lock:
+            if time.monotonic() - readiness_at >= 1:
+                try:
+                    async with asyncio.timeout(2):
+                        readiness_ok = (
+                            isinstance(store, RedisStore)
+                            and isinstance(repository, PostgresTelemetryRepository)
+                            and bool(await store.client.ping())
+                            and await repository.ready()
+                        )
+                except Exception as exc:
+                    readiness_ok = False
+                    logger.warning("Readiness check failed: %s", type(exc).__name__)
+                readiness_at = time.monotonic()
+        return JSONResponse(
+            {"status": "ready" if readiness_ok else "not_ready"},
+            status_code=200 if readiness_ok else 503, headers={"Cache-Control": "no-store"},
+        )
+
     async def authenticate_gateway_key(authorization: Annotated[str | None, Header()] = None) -> str:
         if configured_key_hash is None:
             raise HTTPException(status_code=503, detail="Gateway API key is not configured")
         scheme, _, token = (authorization or "").partition(" ")
-        if scheme.lower() != "bearer" or not token or token != token.strip() or " " in token:
+        if scheme.lower() != "bearer" or not token or token != token.strip() or " " in token or len(token) > 256:
             raise HTTPException(status_code=401, detail="Invalid gateway API key")
         supplied_hash = hashlib.sha256(token.encode()).digest()
         if hmac.compare_digest(supplied_hash, configured_key_hash):
@@ -352,6 +401,12 @@ def create_app(
     ) -> ChatResponse:
         trace: RequestTelemetry = http_request.state.telemetry
         trace.model_alias = request.model
+        if "max_tokens" not in request.model_fields_set:
+            request = request.model_copy(update={"max_tokens": min(request.max_tokens, safety.output_tokens)})
+        if not safety.accepts(request):
+            raise HTTPException(status_code=422, detail="Request exceeds gateway limits")
+        if not deployment.paid_enabled:
+            raise HTTPException(status_code=503, detail="Provider access is disabled")
         assert trace.gateway_key_id is not None
         try:
             allowed = await store.allow(trace.gateway_key_id)
@@ -412,44 +467,59 @@ def create_app(
                         })
         request_id = str(trace.request_id)
         try:
-            outcome = await generate_with_fallback(
-                initial_provider=provider_name,
-                alias=route,
-                providers=selected_providers,
-                messages=messages,
-                options=options,
-                policy=policy,
-                allow_fallback=request.provider is None,
-            )
-        except RouteFailure as exc:
-            trace.final_provider = exc.final_provider
-            trace.actual_model = route.models.get(exc.final_provider)
-            trace.retry_count = exc.retry_count
-            trace.failure_reason = exc.failure_reason
-            trace.attempts = exc.attempts
-            raise HTTPException(
-                status_code=504 if exc.failure_reason == "deadline_exceeded" else 502,
-                detail={
-                    "message": (
-                        "Request deadline exceeded"
-                        if exc.failure_reason == "deadline_exceeded"
-                        else "Provider request failed"
-                    ),
-                    "request_id": request_id,
-                    "initial_provider": exc.initial_provider,
-                    "final_provider": exc.final_provider,
-                    "retry_count": exc.retry_count,
-                    "failure_reason": exc.failure_reason,
-                    "attempts": [
-                        AttemptResponse(
-                            provider=attempt.provider,
-                            model=attempt.model,
-                            failure_reason=attempt.failure_reason,
-                        ).model_dump()
-                        for attempt in exc.attempts
-                    ],
-                },
-            ) from exc
+            async with asyncio.timeout(0.75):
+                lease = await admission.acquire(trace.gateway_key_id, policy.deadline_seconds + 10)
+        except (RedisError, TimeoutError) as exc:
+            raise HTTPException(status_code=503, detail="Admission control unavailable") from exc
+        if lease is None:
+            raise HTTPException(status_code=429, detail="Provider concurrency limit exceeded", headers={"Retry-After": "1"})
+        try:
+            try:
+                outcome = await generate_with_fallback(
+                    initial_provider=provider_name,
+                    alias=route,
+                    providers=selected_providers,
+                    messages=messages,
+                    options=options,
+                    policy=policy,
+                    allow_fallback=request.provider is None,
+                )
+            except RouteFailure as exc:
+                trace.final_provider = exc.final_provider
+                trace.actual_model = route.models.get(exc.final_provider)
+                trace.retry_count = exc.retry_count
+                trace.failure_reason = exc.failure_reason
+                trace.attempts = exc.attempts
+                raise HTTPException(
+                    status_code=504 if exc.failure_reason == "deadline_exceeded" else 502,
+                    detail={
+                        "message": (
+                            "Request deadline exceeded"
+                            if exc.failure_reason == "deadline_exceeded"
+                            else "Provider request failed"
+                        ),
+                        "request_id": request_id,
+                        "initial_provider": exc.initial_provider,
+                        "final_provider": exc.final_provider,
+                        "retry_count": exc.retry_count,
+                        "failure_reason": exc.failure_reason,
+                        "attempts": [
+                            AttemptResponse(
+                                provider=attempt.provider,
+                                model=attempt.model,
+                                failure_reason=attempt.failure_reason,
+                            ).model_dump()
+                            for attempt in exc.attempts
+                        ],
+                    },
+                ) from exc
+        finally:
+            try:
+                async with asyncio.timeout(0.75):
+                    await admission.release(trace.gateway_key_id, lease)
+            except (RedisError, TimeoutError) as exc:
+                # The bounded lease expires even if release cannot reach Redis.
+                logger.warning("Admission lease release failed: %s", type(exc).__name__)
         result = outcome.generation
         trace.final_provider = outcome.final_provider
         trace.actual_model = result.model
@@ -494,6 +564,9 @@ def create_app(
                 logger.warning("Redis cache write failed: %s", type(exc).__name__)
         return response
 
+    if deployment.static_dir is not None:
+        app.mount("/", StaticFiles(directory=deployment.static_dir, html=True), name="dashboard")
+    app.add_middleware(IngressGuard, store=admission, policy=safety, production=deployment.production)
     return app
 
 

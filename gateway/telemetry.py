@@ -97,6 +97,16 @@ class PostgresTelemetryRepository:
     async def close(self) -> None:
         await self.pool.close()
 
+    async def ready(self) -> bool:
+        async with self.pool.connection() as connection:
+            versions = await (await connection.execute(
+                "SELECT version FROM schema_migrations WHERE version = ANY(%s)",
+                (["001_request_telemetry", "002_gateway_keys"],),
+            )).fetchall()
+            await connection.execute("SELECT " + ", ".join(INSERT_COLUMNS) + ", created_at FROM request_telemetry LIMIT 0")
+            await connection.execute("SELECT id, key_hash, name, created_at, revoked_at FROM gateway_keys LIMIT 0")
+        return len(versions) == 2
+
     async def record(self, event: RequestTelemetry) -> None:
         async with self.pool.connection() as connection:
             await connection.execute(INSERT_SQL, event.parameters())

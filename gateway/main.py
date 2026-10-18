@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 # An explicit local .env overrides stale exported values. Containers without the
 # file retain the environment injected by Compose.
-load_dotenv(os.getenv("GATEWAY_ENV_FILE", ".env"), override=True)
+if os.getenv("GATEWAY_ENV") != "production":
+    load_dotenv(os.getenv("GATEWAY_ENV_FILE", ".env"), override=True)
 
 from gateway.app import app  # noqa: E402
