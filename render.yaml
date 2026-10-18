@@ -1,22 +1,26 @@
 # Configuration only. No resources have been created or deployed.
-# Supply same-region internal URLs for separately managed Postgres/Key Value.
+# Supply Neon direct PostgreSQL and Upstash native Redis TLS URLs privately.
+# Upstash console: keep Eviction DISABLED; this file cannot configure that account.
 services:
   - type: web
     name: llm-gateway-private-demo
     runtime: docker
-    plan: 0.5c-512mb
+    plan: free
     region: oregon
     numInstances: 1
     dockerfilePath: ./Dockerfile
     dockerContext: .
     autoDeployTrigger: "off"
-    healthCheckPath: /readyz
-    preDeployCommand: python -m gateway.migrate
+    healthCheckPath: /health
     envVars:
       - key: GATEWAY_ENV
         value: production
       - key: GATEWAY_DATASTORE_NETWORK
-        value: render-private
+        value: tls
+      - key: GATEWAY_RUN_MIGRATIONS
+        value: "true"
+      - key: PGSSLROOTCERT
+        value: /etc/ssl/certs/ca-certificates.crt
       - key: GATEWAY_PAID_PROVIDERS_ENABLED
         value: "false"
       - key: GATEWAY_API_KEY
@@ -24,10 +28,6 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: REDIS_URL
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: ANTHROPIC_API_KEY
         sync: false
       - key: GATEWAY_MODEL_ALIASES
         value: '{"fast":{"default_provider":"openai","models":{"openai":"gpt-4.1-mini-2025-04-14","anthropic":"claude-haiku-4-5-20251001"}},"smart":{"default_provider":"anthropic","models":{"openai":"gpt-4.1-2025-04-14","anthropic":"claude-sonnet-4-6"}}}'

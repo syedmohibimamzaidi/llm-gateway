@@ -167,7 +167,7 @@ strict overrides, deadlines, cache isolation/expiry, rate limiting, private
 telemetry, known-row analytics, and dependency failures. Provider responses in
 the automated suite are fake; no paid calls are needed.
 
-The deployment regression suite passes **109 backend tests with real local
+The deployment regression suite passes **119 backend tests with real local
 Redis/PostgreSQL**, including shared admission/lease expiry, bounded requests,
 production validation, same-origin routes, migration replay/rollback, and schema
 readiness. Frontend key-input tests and production builds are also checked.
@@ -225,38 +225,82 @@ behavior. Live-provider availability, billing, and deployment need separate chec
 
 ## Render demo configuration and release checks
 
-[`render.yaml`](render.yaml) defines one Docker web service with auto-deploys
-off, `/readyz` health checks, and `python -m gateway.migrate` as its pre-deploy
-command. The migration runner uses a database advisory lock, transactional SQL,
-and a statement timeout. Compose retains its services, migrations, volumes, and
-ports; its dashboard image now serves built assets through Nginx.
+[`render.yaml`](render.yaml) targets **Render Free + Neon Free + Upstash Free**.
+It defines one Docker web service with auto-deploys off and paid-provider access
+explicitly disabled. There is no separate frontend service, paid instance,
+pre-deploy command, or provisioned datastore in the file. Compose retains its
+existing migration service, volumes, ports, and readiness health check.
 
-The Render file contains **no credentials and no database/Key Value resources**.
-Supply private environment values through Render's secret configuration when
-you choose to deploy. Production ignores dotenv files so they cannot override
-injected secrets. Required values are `GATEWAY_API_KEY` (32–256 characters with
-sufficient variety), `DATABASE_URL`, `REDIS_URL`, aliases, and versioned pricing.
-Provider credentials are only needed when paid access is explicitly enabled;
-every alias's default provider must then have a valid configured credential.
+Render polls `/health`, a liveness endpoint that makes **no Redis or PostgreSQL
+calls**. `/readyz` remains a separate, on-demand dependency/schema check; do not
+use it for frequent uptime polling on this profile. It can wake Neon compute.
+The application pool starts with zero connections and has no background SQL
+keepalive. Actual analytics, authentication, or telemetry work can wake Neon.
 
-Use same-region Render Postgres/Key Value **internal URLs** with
-`GATEWAY_DATASTORE_NETWORK=render-private` (short `dpg-...` / `red-...` hosts).
-For other hosts use `tls`: PostgreSQL requires `sslmode=verify-full` and the
-appropriate CA; Redis requires `rediss://` with certificate and hostname
-verification. Configure a dedicated Key Value instance with **noeviction** and
-suitable persistence, block external access, and size its memory/connection
-limits. Do not share it with workloads that can evict or overwrite admission
-state. The prepared pre-deploy profile uses `DATABASE_URL` for both migrations and
-runtime. Before broader use, arrange separate migration/runtime roles; runtime
-needs only the application table permissions, not schema ownership.
+With `GATEWAY_RUN_MIGRATIONS=true`, the container entrypoint validates production
+connection security and runs migrations **before opening the HTTP port**. A
+migration failure exits with a safe error type; the server does not start. Each
+restart safely replays the transactional SQL under an advisory lock and statement
+timeout. Use Neon's **direct endpoint**, not its `-pooler` endpoint: migrations
+need session-level locking. The direct endpoint also serves the small runtime
+pool. This profile uses one database role for migration and runtime; separate
+roles remain an improvement before broader use.
+
+Required private Render variables are `GATEWAY_API_KEY` (32–256 characters with
+sufficient variety), `DATABASE_URL`, and `REDIS_URL`. The Blueprint supplies
+production mode, `GATEWAY_DATASTORE_NETWORK=tls`, migration startup, model aliases,
+versioned pricing, and conservative limits. Production ignores dotenv files.
+Keep `GATEWAY_PAID_PROVIDERS_ENABLED=false` and omit both provider credentials.
+
+For Neon, use a direct `postgresql://` connection with `sslmode=verify-full`.
+The Blueprint sets `PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt`, the system CA
+bundle in the Debian-based runtime image. For Upstash, use the **native Redis TCP
+endpoint** with `rediss://`, its database password, and certificate/hostname
+verification (`ssl_cert_reqs=required&ssl_check_hostname=true`). An HTTPS REST
+URL/token does not work with our Redis client. Never disable TLS verification.
+Choose geographically close datastore regions to fit the existing short
+connection timeouts; actual hosted handshakes and cold starts remain unverified.
+
+In the Upstash console, keep **Eviction disabled**, persistence enabled, and
+automatic paid upgrades disabled. `render.yaml` cannot control another account's
+database settings. Use a dedicated database: eviction or state loss would erase
+rate counters and concurrency leases as well as cached responses. Redis quota
+or connectivity errors fail admission closed (503). PostgreSQL wake-up latency
+can exceed our short pool/telemetry budgets, producing temporary 503 responses
+or reported telemetry write failures. Telemetry remains best effort.
+
+### Account and manual deployment steps
+
+1. Create a Neon Free project/database. Select a nearby region, copy its **direct**
+   connection string privately, and add `sslmode=verify-full`.
+2. Create an account-owned Upstash Free Redis database in a nearby region. Leave
+   Eviction and automatic upgrades off. Copy the native TLS connection URL,
+   including its database password, privately; do not use REST credentials.
+3. Create a Render Hobby account and connect the GitHub repository. **After the
+   reviewed configuration has been committed and pushed by the owner**, create
+   the Free Docker web service from `render.yaml`, supply the three private
+   variables, and confirm auto-deploys are off before the initial deployment.
+   Creating/applying a Blueprint can initiate that first deployment; it is an
+   explicit manual release action, not an account-only setup step.
+4. After startup migrations complete, verify `/health`, then check `/readyz` once
+   and test dashboard authentication. Keep provider access disabled. Use fake
+   providers for any subsequent request-flow verification; this profile does
+   not automatically install a fake-provider route.
+
+Free hosting is for an intermittent demo: Render sleeps after 15 idle minutes;
+Neon compute sleeps after five, while stored data survives. Quotas, cold starts,
+and Upstash inactivity policies can interrupt access. The current Upstash pricing
+page advertises 500K commands/month; Lua's internal commands count too. Check
+actual account allowances and retain independent database exports. No hosted
+backup, restore, or rollback drill has been completed.
 
 The web service's HTML is publicly reachable, but paid API access is key-gated.
 Render's network-private service type is different: it has no public browser URL.
 Add an outer identity/IP-access gate if the entire UI must be private. No keys
 should appear in URLs, logs, CI artifacts, or screenshots.
 
-Before enabling paid access, verify Render's Blueprint validation and chosen
-paid plan's pre-deploy support, CI results, actual TLS/internal connections,
+Before enabling paid access, verify Render's Blueprint validation, CI results,
+actual TLS connections and hostname verification, cold starts and idle compute,
 migration status, `/readyz`, UI/API routing, missing/incorrect/revoked-key
 rejection, security headers, and log redaction. Confirm admission saturation
 and dependency-outage behavior using **fake providers**, plus provider-account
@@ -291,9 +335,11 @@ Render documents [web services](https://render.com/docs/web-services),
 [Blueprint configuration](https://render.com/docs/blueprint-spec),
 [health checks](https://render.com/docs/health-checks),
 [private services](https://render.com/docs/private-services),
-[Postgres connections](https://render.com/docs/postgresql-creating-connecting),
-[Key Value networking](https://render.com/docs/key-value),
-[database recovery](https://render.com/docs/postgresql-backups), and
+[free hosting limits](https://render.com/docs/free),
+[Neon TLS](https://neon.com/docs/connect/connect-securely),
+[Neon pooling](https://neon.com/docs/connect/connection-pooling),
+[Upstash compatibility](https://upstash.com/docs/redis/overall/compatibility),
+[Upstash eviction](https://upstash.com/docs/redis/features/eviction), and
 [rollbacks](https://render.com/docs/rollbacks).
 
 ## Author

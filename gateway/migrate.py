@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
@@ -15,6 +16,9 @@ def migrate(dsn: str, directory: Path = MIGRATIONS) -> None:
     files = sorted(directory.glob("*.sql"))
     if not dsn or not files:
         raise ValueError("Migration database or SQL files are missing")
+    hosts = conninfo_to_dict(dsn).get("host", "").split(",")
+    if any(host.endswith(".neon.tech") and "-pooler" in host.split(".")[0] for host in hosts):
+        raise ValueError("Migrations require a direct Neon endpoint for session locking")
     with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as connection:
         connection.execute("SET statement_timeout = '30s'")
         connection.execute("SELECT pg_advisory_lock(%s)", (LOCK_ID,))

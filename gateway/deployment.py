@@ -52,34 +52,39 @@ class Deployment:
                 value = os.getenv(name, "")
                 if value and (len(value) < 20 or "replace-with" in value.lower() or value != value.strip()):
                     raise ValueError("Invalid production provider credential")
-        network = os.getenv("GATEWAY_DATASTORE_NETWORK", "tls")
-        if network not in {"tls", "render-private"}:
-            raise ValueError("Invalid GATEWAY_DATASTORE_NETWORK")
-        for kind, url in (("database", database_url), ("redis", redis_url)):
-            try:
-                parsed = urlsplit(url or "")
-                if not parsed.hostname or parsed.hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+        validate_datastore_urls(database_url, redis_url)
+
+
+def validate_datastore_urls(database_url, redis_url):
+    """Validate production transports before either runtime or migrations connect."""
+    network = os.getenv("GATEWAY_DATASTORE_NETWORK", "tls")
+    if network not in {"tls", "render-private"}:
+        raise ValueError("Invalid GATEWAY_DATASTORE_NETWORK")
+    for kind, url in (("database", database_url), ("redis", redis_url)):
+        try:
+            parsed = urlsplit(url or "")
+            if not parsed.hostname or parsed.hostname in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+                raise ValueError
+            if parsed.port is not None and not 1 <= parsed.port <= 65535:
+                raise ValueError
+            if kind == "database":
+                if parsed.scheme not in {"postgres", "postgresql"} or not parsed.username or not parsed.password or parsed.password == "gateway-dev-password" or not parsed.path.strip("/"):
                     raise ValueError
-                if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            elif parsed.scheme not in {"redis", "rediss"}:
+                raise ValueError
+            query = parse_qs(parsed.query)
+            if kind == "redis" and parsed.scheme == "rediss":
+                if query.get("ssl_cert_reqs", ["required"]) != ["required"] or query.get("ssl_check_hostname", ["true"]) != ["true"]:
                     raise ValueError
-                if kind == "database":
-                    if parsed.scheme not in {"postgres", "postgresql"} or not parsed.username or not parsed.password or parsed.password == "gateway-dev-password" or not parsed.path.strip("/"):
-                        raise ValueError
-                elif parsed.scheme not in {"redis", "rediss"}:
+            if network == "render-private":
+                # Explicit opt-in to same-region Render private networking.
+                prefix = "dpg-" if kind == "database" else "red-"
+                if not parsed.hostname.startswith(prefix) or "." in parsed.hostname:
                     raise ValueError
-                query = parse_qs(parsed.query)
-                if kind == "redis" and parsed.scheme == "rediss":
-                    if query.get("ssl_cert_reqs", ["required"]) != ["required"] or query.get("ssl_check_hostname", ["true"]) != ["true"]:
-                        raise ValueError
-                if network == "render-private":
-                    # Explicit opt-in to same-region Render private networking.
-                    prefix = "dpg-" if kind == "database" else "red-"
-                    if not parsed.hostname.startswith(prefix) or "." in parsed.hostname:
-                        raise ValueError
-                elif kind == "database":
-                    if parse_qs(parsed.query).get("sslmode") != ["verify-full"]:
-                        raise ValueError
-                elif parsed.scheme != "rediss":
+            elif kind == "database":
+                if parse_qs(parsed.query).get("sslmode") != ["verify-full"]:
                     raise ValueError
-            except (ValueError, TypeError):
-                raise ValueError(f"Invalid production {kind} connection configuration") from None
+            elif parsed.scheme != "rediss":
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid production {kind} connection configuration") from None

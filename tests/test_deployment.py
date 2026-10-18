@@ -161,12 +161,17 @@ def test_production_entrypoint_never_loads_local_dotenv(production, tmp_path):
 def test_render_and_ci_configuration_are_private_by_default():
     blueprint = yaml.safe_load((ROOT / "render.yaml").read_text())
     service, = blueprint["services"]
-    assert service["runtime"] == "docker" and service["healthCheckPath"] == "/readyz"
+    assert service["runtime"] == "docker" and service["healthCheckPath"] == "/health"
+    assert service["plan"] == "free"
     assert service["autoDeployTrigger"] in {"off", False}  # YAML 1.1 treats off as false.
-    assert service["preDeployCommand"] == "python -m gateway.migrate"
+    assert "preDeployCommand" not in service
     variables = {v["key"]: v for v in service["envVars"]}
     assert variables["GATEWAY_PAID_PROVIDERS_ENABLED"]["value"] == "false"
-    for name in ("GATEWAY_API_KEY", "DATABASE_URL", "REDIS_URL", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+    assert variables["GATEWAY_RUN_MIGRATIONS"]["value"] == "true"
+    assert variables["GATEWAY_DATASTORE_NETWORK"]["value"] == "tls"
+    assert variables["PGSSLROOTCERT"]["value"] == "/etc/ssl/certs/ca-certificates.crt"
+    assert "OPENAI_API_KEY" not in variables and "ANTHROPIC_API_KEY" not in variables
+    for name in ("GATEWAY_API_KEY", "DATABASE_URL", "REDIS_URL"):
         assert variables[name] == {"key": name, "sync": False}
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
     assert workflow["permissions"] == {"contents": "read"}
