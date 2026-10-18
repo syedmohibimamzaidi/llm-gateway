@@ -36,8 +36,8 @@ async function loadJson(path, key, signal) {
     signal,
   })
   if (!response.ok) {
-    if (response.status === 401) throw new Error('Gateway key rejected. Use the GATEWAY_API_KEY value from .env, not an OpenAI or Anthropic key.')
-    if (response.status === 503) throw new Error('Analytics is unavailable. Check PostgreSQL and the gateway.')
+    if (response.status === 401) throw new Error('Gateway key rejected. Use an active gateway key supplied privately by the owner.')
+    if (response.status === 503) throw new Error('Analytics is temporarily unavailable. Please try again.')
     throw new Error(`Analytics request failed (${response.status}).`)
   }
   return response.json()
@@ -108,15 +108,15 @@ function App() {
   return <div className="page">
     <header className="masthead">
       <div className="brand"><span className="brand-mark">G</span><span>Gateway <b>Analytics</b></span></div>
-      <span className="environment">LOCAL TELEMETRY</span>
+      <span className="environment">GATEWAY TELEMETRY</span>
     </header>
 
     <main>
       <section className="intro">
         <div>
-          <p className="eyebrow">OBSERVABILITY / DAY 6</p>
+          <p className="eyebrow">REQUEST ANALYTICS</p>
           <h1>One view of every request.</h1>
-          <p className="subhead">Usage, outcomes, and provider performance from PostgreSQL telemetry.</p>
+          <p className="subhead">Usage, outcomes, and estimated costs across your providers.</p>
         </div>
         {key && <button className="text-button" onClick={() => {
           setKey(''); setDraftKey(''); setData(null); setError('')
@@ -124,9 +124,9 @@ function App() {
       </section>
 
       {!key ? <><form className="connect-panel" onSubmit={connect}>
-        <div><h2>Connect to your gateway</h2><p>Enter the gateway API key to read analytics. It stays in this tab’s memory.</p></div>
+        <div><h2>Connect to your gateway</h2><p>Enter your private gateway key to read analytics. It stays in this tab’s memory.</p></div>
         <div className="connect-controls">
-          <label htmlFor="gateway-key">GATEWAY_API_KEY from .env</label>
+          <label htmlFor="gateway-key">Gateway API key</label>
           <div className="input-row">
             <input id="gateway-key" type="password" value={draftKey}
               onChange={(event) => setDraftKey(event.target.value)} autoComplete="off" required />

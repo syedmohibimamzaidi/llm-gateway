@@ -7,3 +7,8 @@
 dashboard/node_modules
 dashboard/dist
 prices.json
+
+.env.*
+!.env.example
+*.pem
+*.key

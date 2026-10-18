@@ -15,5 +15,8 @@
   },
   "devDependencies": {
     "vite": "^8.0.0"
+  },
+  "overrides": {
+    "source-map-js": "1.2.2"
   }
 }

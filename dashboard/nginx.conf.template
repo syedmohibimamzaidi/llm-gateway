@@ -1,0 +1,17 @@
+server {
+    listen 5173;
+    server_name _;
+    root /usr/share/nginx/html;
+    client_max_body_size 64k;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    location ~ ^/(analytics(/|$)|requests(/|$)|v1(/|$)|api-keys(/|$)|health$|readyz$|docs$|openapi\.json$) {
+        proxy_pass ${GATEWAY_API_PROXY_TARGET};
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header Host $host;
+        proxy_read_timeout 75s;
+    }
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}

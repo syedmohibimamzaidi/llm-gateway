@@ -5,3 +5,8 @@ __pycache__/
 *.egg-info/
 dashboard/node_modules/
 dashboard/dist/
+
+.env.*
+!.env.example
+*.pem
+*.key
