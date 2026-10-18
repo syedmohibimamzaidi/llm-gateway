@@ -1,0 +1,79 @@
+name: CI
+"on": [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: ci-fixture-password
+          POSTGRES_DB: gateway
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gateway -d gateway"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      GATEWAY_ENV: test
+      TEST_DATABASE_URL: postgresql://gateway:ci-fixture-password@127.0.0.1:5432/gateway
+      TEST_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: python -m pip install -c requirements.lock -e '.[test]'
+      - run: python -m pip check
+      - run: python -m gateway.migrate
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+      - run: python -m gateway.migrate
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
+      - run: python -m pytest -q
+      - run: npm ci && npm audit --audit-level=high && npm test && npm run build
+        working-directory: dashboard
+      - name: Build production images
+        run: |
+          docker build -t gateway-ci .
+          docker build -t gateway-dashboard-ci dashboard
+      - name: Smoke-test same-origin dashboard and API without provider credentials
+        run: |
+          docker run -d --name gateway-ci --network host \
+            -e GATEWAY_ENV=test -e PORT=18000 \
+            -e GATEWAY_API_KEY=ci-only-gateway-fixture \
+            -e GATEWAY_PAID_PROVIDERS_ENABLED=false \
+            -e DATABASE_URL="$TEST_DATABASE_URL" -e REDIS_URL="$TEST_REDIS_URL" gateway-ci
+          trap 'docker rm -f gateway-dashboard-ci gateway-ci' EXIT
+          for attempt in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18000/readyz && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18000/readyz
+          curl -fsS http://127.0.0.1:18000/ | grep -q 'Gateway'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18000/analytics/summary)" = 401
+          curl -fsS -H 'Authorization: Bearer ci-only-gateway-fixture' http://127.0.0.1:18000/analytics/summary
+          docker run -d --name gateway-dashboard-ci --network host \
+            -e GATEWAY_API_PROXY_TARGET=http://127.0.0.1:18000 gateway-dashboard-ci
+          for attempt in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:5173/ && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:5173/ | grep -q 'Gateway'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5173/analytics/summary)" = 401
+          curl -fsS -H 'Authorization: Bearer ci-only-gateway-fixture' http://127.0.0.1:5173/analytics/summary

@@ -1,0 +1,47 @@
+# Configuration only. No resources have been created or deployed.
+# Supply same-region internal URLs for separately managed Postgres/Key Value.
+services:
+  - type: web
+    name: llm-gateway-private-demo
+    runtime: docker
+    plan: 0.5c-512mb
+    region: oregon
+    numInstances: 1
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: "off"
+    healthCheckPath: /readyz
+    preDeployCommand: python -m gateway.migrate
+    envVars:
+      - key: GATEWAY_ENV
+        value: production
+      - key: GATEWAY_DATASTORE_NETWORK
+        value: render-private
+      - key: GATEWAY_PAID_PROVIDERS_ENABLED
+        value: "false"
+      - key: GATEWAY_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GATEWAY_MODEL_ALIASES
+        value: '{"fast":{"default_provider":"openai","models":{"openai":"gpt-4.1-mini-2025-04-14","anthropic":"claude-haiku-4-5-20251001"}},"smart":{"default_provider":"anthropic","models":{"openai":"gpt-4.1-2025-04-14","anthropic":"claude-sonnet-4-6"}}}'
+      - key: GATEWAY_PRICE_CONFIG_PATH
+        value: /app/prices.live.json
+      - key: GATEWAY_MAX_OUTPUT_TOKENS
+        value: "256"
+      - key: GATEWAY_MAX_CONCURRENCY
+        value: "4"
+      - key: GATEWAY_MAX_KEY_CONCURRENCY
+        value: "1"
+      - key: GATEWAY_RATE_LIMIT
+        value: "10"
+      - key: GATEWAY_MAX_RETRIES
+        value: "1"
+      - key: GATEWAY_REQUEST_DEADLINE_SECONDS
+        value: "30"
