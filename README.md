@@ -8,9 +8,15 @@ concerns behind one authenticated chat API for OpenAI and Anthropic.
 
 Clients select a model alias such as `fast` or `smart`. The gateway routes the
 request, limits usage, optionally reuses a cached response, and records token,
-latency, and estimated cost data for a React dashboard. The MVP includes an
-unapplied Render configuration for a private, key-gated demo. No deployment
-or live demo URL is included.
+latency, and estimated cost data for a React dashboard. The hosted MVP runs on
+Render with Neon PostgreSQL and Upstash Redis.
+
+[Hosted dashboard — gateway key required; access available on request.](https://llm-gateway-private-demo.onrender.com)
+
+Credentials are not publicly shared or embedded in the frontend. Ask the author
+for a private gateway key; no provider credentials are needed to view analytics.
+The free Render service sleeps after 15 idle minutes, so the first visit may
+take about a minute to load. Database wake-up can add a short delay.
 
 ## Tech stack
 
@@ -137,7 +143,7 @@ there is no durable replay, so dashboard totals can be incomplete.
 ### Make pricing explicit and versioned
 
 Costs use the final provider's reported usage and **returned model ID**, with
-USD-per-million-token rates and decimal arithmetic. Compose selects
+USD-per-million-token rates and decimal arithmetic. The hosted profile selects
 `prices.live.json`, a bundled rate snapshot with version
 `official-standard-text-2026-10-03`; recheck rates before billing decisions.
 `prices.json` and `prices.example.json` are **test pricing only**. Missing rates
@@ -170,10 +176,39 @@ the automated suite are fake; no paid calls are needed.
 The deployment regression suite passes **119 backend tests with real local
 Redis/PostgreSQL**, including shared admission/lease expiry, bounded requests,
 production validation, same-origin routes, migration replay/rollback, and schema
-readiness. Frontend key-input tests and production builds are also checked.
-GitHub Actions runs real dependency services, migrations, the full suite,
-frontend tests/build/audit, and Docker image smoke checks. Passing local or CI
-checks does not establish hosted readiness.
+readiness. All **3 frontend key-input tests** and the dashboard production build
+also passed. [GitHub Actions](https://github.com/syedmohibimamzaidi/llm-gateway/actions/runs/39093657491)
+passed migrations, the full suite, frontend tests/build/audit, and Docker image
+smoke checks with real dependency services. Automated provider responses are
+simulated; hosted live-provider checks are recorded separately below.
+
+### Hosted smoke checks
+
+An unpaid hosted check verified invalid-key rejection (401), authenticated
+analytics and history (200), and a blocked chat request (503) while paid access
+was disabled. The blocked request appeared in history with no routed provider,
+tokens, or estimated cost.
+
+The owner then enabled provider access and confirmed the deployed retry limit
+was zero. Exactly **two authorized live requests** used the `fast` alias, a
+"Say hello" prompt, `max_tokens=24`, and `cache=false`, with one strict override
+per provider. Both returned 200 with a greeting, one upstream attempt, zero
+retries, no fallback, and `X-Telemetry-Status: stored`.
+
+| Provider | Returned model | Input tokens | Output tokens | Estimated USD |
+| --- | --- | ---: | ---: | ---: |
+| OpenAI | `gpt-4.1-mini-2025-04-14` | 9 | 9 | $0.000018 |
+| Anthropic | `claude-haiku-4-5-20251001` | 9 | 16 | $0.000089 |
+
+Costs were independently calculated from reported usage at the configured
+input/output rates: OpenAI **$0.40/$1.60**, Anthropic **$1.00/$5.00**, per million
+tokens, using pricing version `official-standard-text-2026-10-03`. Matching
+request-history rows, dashboard analytics totals, and provider breakdowns were
+verified. The two requests added **18 input tokens, 25 output tokens, and
+$0.000107 estimated cost**. These are point-in-time functional checks, not a
+live-provider performance benchmark or invoice reconciliation.
+
+### Simulated workload
 
 The fake-provider load script sends 40 requests at peak concurrency 5: ten cache
 warm-ups, ten repeats, sixteen unique requests, and four fallback cases. A
@@ -183,34 +218,18 @@ p95 response latency, with USD 0.000510 in **fixture-priced** estimated usage.
 These are **in-process ASGI measurements with simulated providers**, not
 live-provider latency, billed cost, or production HTTP throughput.
 
-To run checks from the repository root, use Python 3.11+ (commands use 3.12),
-Node.js 22.12+, and npm:
-
-```sh
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -c requirements.lock -e '.[test]'
-.venv/bin/python -m pytest -q
-(cd dashboard && npm ci && npm test && npm run build)
-```
-
-Service tests skip unless test URLs are supplied. With Compose running and its
-migrations complete, run the full backend suite against disposable local data:
-
-```sh
-export TEST_DATABASE_URL=postgresql://gateway:gateway-dev-password@127.0.0.1:5434/gateway
-export TEST_REDIS_URL=redis://127.0.0.1:6380/0
-.venv/bin/python -m pytest -q
-.venv/bin/python scripts/load_test.py
-```
-
 Integration tests and the load script create random fixture keys/rows and remove
 their own data. Frontend helper tests/builds do not verify interactive browser
-behavior. Live-provider availability, billing, and deployment need separate checks.
+behavior. Hosted smoke checks verified the dashboard's authenticated API data;
+a full interactive browser review remains separate.
 
 ## Known limitations
 
-- Render configuration is prepared but unapplied. Hosting, platform validation,
-  TLS, backups, restore, rollback, and external account access need verification.
+- Free hosting has cold starts and quota/inactivity limits. Two successful live
+  requests do not establish production capacity, uptime, or future availability.
+- Hosted backup, restore, and rollback drills remain unverified. Datastore TLS
+  settings, eviction/persistence policy, and idle compute usage have not been
+  independently audited in the hosting accounts.
 - Text-only, nonstreaming chat; no separate administrator roles, key-rotation API,
   or key-creation audit log. The configured management key rotates via config.
 - Best-effort telemetry has no durable queue/replay. Database outages make
@@ -223,13 +242,14 @@ behavior. Live-provider availability, billing, and deployment need separate chec
 - Cache repeatability is a policy, not a guarantee of deterministic model output.
   Offset pagination can shift if new requests arrive between page reads.
 
-## Render demo configuration and release checks
+## Hosted deployment and operations
 
-[`render.yaml`](render.yaml) targets **Render Free + Neon Free + Upstash Free**.
-It defines one Docker web service with auto-deploys off and paid-provider access
-explicitly disabled. There is no separate frontend service, paid instance,
-pre-deploy command, or provisioned datastore in the file. Compose retains its
-existing migration service, volumes, ports, and readiness health check.
+The dashboard and API share one Render Free Docker web service, with Neon Free
+for PostgreSQL and Upstash Free for Redis. The checked-in [`render.yaml`](render.yaml)
+keeps auto-deploys off and defaults paid-provider access to disabled. Provider
+access was explicitly enabled by the owner for the recorded live smoke tests;
+the Blueprint defaults are not a report of the current service environment.
+Datastores and private environment values are managed separately from this file.
 
 Render polls `/health`, a liveness endpoint that makes **no Redis or PostgreSQL
 calls**. `/readyz` remains a separate, on-demand dependency/schema check; do not
@@ -250,7 +270,9 @@ Required private Render variables are `GATEWAY_API_KEY` (32–256 characters wit
 sufficient variety), `DATABASE_URL`, and `REDIS_URL`. The Blueprint supplies
 production mode, `GATEWAY_DATASTORE_NETWORK=tls`, migration startup, model aliases,
 versioned pricing, and conservative limits. Production ignores dotenv files.
-Keep `GATEWAY_PAID_PROVIDERS_ENABLED=false` and omit both provider credentials.
+Keep paid access disabled outside owner-authorized use. Enabling it requires
+private `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` credentials; these are never
+supplied to dashboard visitors.
 
 For Neon, use a direct `postgresql://` connection with `sslmode=verify-full`.
 The Blueprint sets `PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt`, the system CA
@@ -258,8 +280,9 @@ bundle in the Debian-based runtime image. For Upstash, use the **native Redis TC
 endpoint** with `rediss://`, its database password, and certificate/hostname
 verification (`ssl_cert_reqs=required&ssl_check_hostname=true`). An HTTPS REST
 URL/token does not work with our Redis client. Never disable TLS verification.
-Choose geographically close datastore regions to fit the existing short
-connection timeouts; actual hosted handshakes and cold starts remain unverified.
+Geographically close datastore regions help fit the existing short connection
+timeouts. Hosted application connectivity passed the smoke checks; certificate
+settings and cold-start timing were not independently audited.
 
 In the Upstash console, keep **Eviction disabled**, persistence enabled, and
 automatic paid upgrades disabled. `render.yaml` cannot control another account's
@@ -268,24 +291,6 @@ rate counters and concurrency leases as well as cached responses. Redis quota
 or connectivity errors fail admission closed (503). PostgreSQL wake-up latency
 can exceed our short pool/telemetry budgets, producing temporary 503 responses
 or reported telemetry write failures. Telemetry remains best effort.
-
-### Account and manual deployment steps
-
-1. Create a Neon Free project/database. Select a nearby region, copy its **direct**
-   connection string privately, and add `sslmode=verify-full`.
-2. Create an account-owned Upstash Free Redis database in a nearby region. Leave
-   Eviction and automatic upgrades off. Copy the native TLS connection URL,
-   including its database password, privately; do not use REST credentials.
-3. Create a Render Hobby account and connect the GitHub repository. **After the
-   reviewed configuration has been committed and pushed by the owner**, create
-   the Free Docker web service from `render.yaml`, supply the three private
-   variables, and confirm auto-deploys are off before the initial deployment.
-   Creating/applying a Blueprint can initiate that first deployment; it is an
-   explicit manual release action, not an account-only setup step.
-4. After startup migrations complete, verify `/health`, then check `/readyz` once
-   and test dashboard authentication. Keep provider access disabled. Use fake
-   providers for any subsequent request-flow verification; this profile does
-   not automatically install a fake-provider route.
 
 Free hosting is for an intermittent demo: Render sleeps after 15 idle minutes;
 Neon compute sleeps after five, while stored data survives. Quotas, cold starts,
@@ -299,13 +304,12 @@ Render's network-private service type is different: it has no public browser URL
 Add an outer identity/IP-access gate if the entire UI must be private. No keys
 should appear in URLs, logs, CI artifacts, or screenshots.
 
-Before enabling paid access, verify Render's Blueprint validation, CI results,
-actual TLS connections and hostname verification, cold starts and idle compute,
-migration status, `/readyz`, UI/API routing, missing/incorrect/revoked-key
-rejection, security headers, and log redaction. Confirm admission saturation
-and dependency-outage behavior using **fake providers**, plus provider-account
-budget controls and the kill-switch procedure. Live-provider smoke calls need
-separate explicit authorization; none are required by CI.
+For future releases, verify CI results, startup migrations, `/readyz`, UI/API
+routing, authentication/revocation, security headers, and log redaction. Hosted
+admission saturation and dependency-outage drills remain pending; use **fake
+providers** for those checks. Check provider-account budget controls and the
+kill switch before paid use. Additional live-provider calls require explicit
+owner authorization; none are required by CI.
 
 ### Backup and rollback procedure
 
@@ -331,7 +335,7 @@ separate explicit authorization; none are required by CI.
    verify admission state and cache isolation after recovery.
 
 These are procedures to verify, not completed hosted backup/rollback drills.
-Render documents [web services](https://render.com/docs/web-services),
+Platform references: [Render web services](https://render.com/docs/web-services),
 [Blueprint configuration](https://render.com/docs/blueprint-spec),
 [health checks](https://render.com/docs/health-checks),
 [private services](https://render.com/docs/private-services),
