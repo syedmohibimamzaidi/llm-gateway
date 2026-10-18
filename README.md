@@ -8,16 +8,19 @@ concerns behind one authenticated chat API for OpenAI and Anthropic.
 
 Clients select a model alias such as `fast` or `smart`. The gateway routes the
 request, limits usage, optionally reuses a cached response, and records token,
-latency, and estimated cost data for a React dashboard. This is a local MVP,
-with an emphasis on bounded failure handling and visibility into each request.
+latency, and estimated cost data for a React dashboard. The MVP includes an
+unapplied Render configuration for a private, key-gated demo. No deployment
+or live demo URL is included.
 
 ## Tech stack
 
 - **Backend:** Python 3.11+, FastAPI, Pydantic, HTTPX, and Uvicorn.
 - **Storage:** Redis for rate counters/cache; PostgreSQL with Psycopg for telemetry
   and managed-key records. Schema changes use transactional SQL migrations.
-- **Frontend:** React 19 and Vite 8, with authenticated analytics through a proxy.
-- **Tooling:** Docker Compose, pytest, and Node's built-in test runner.
+- **Frontend:** React 19 and Vite 8; production assets served by FastAPI on Render
+  or Nginx in local Compose, with API requests on the same origin.
+- **Tooling:** Docker Compose, pytest, Node's test runner, and GitHub Actions CI.
+  Runtime Python dependencies are constrained in `requirements.lock`.
 
 ## Main features
 
@@ -48,6 +51,8 @@ flowchart LR
 A chat request passes through authentication, body validation, rate limiting,
 cache lookup, and provider routing. A cache hit skips the provider. The telemetry
 middleware records the outcome, including rejected and failed chat requests.
+The production API image serves the compiled dashboard and API together; no
+Vite development proxy is needed. It honors Render's `PORT` on `0.0.0.0`.
 The dashboard reads `/analytics/summary`, `/analytics/providers`, and `/requests`;
 each endpoint scopes results to the authenticated key.
 
@@ -75,7 +80,33 @@ Expiry cancels the in-flight call and prevents further attempts. Initial/final
 providers, retry count, safe failure reasons, and attempt paths make recovery
 visible. The deadline does not cover the entire HTTP lifecycle.
 
-### Apply rate limits before caching
+### Bound work before accepting provider calls
+
+An outer ingress guard applies global/transport-peer throttling before auth,
+body parsing, or PostgreSQL writes. Bodies are capped at **64 KiB** with a
+5-second receive deadline; messages are capped at **64**, **16,000 characters
+per message**, and **32,000 total characters**. Output is capped at **1,024 tokens**
+by default. The limits can be lowered with the `GATEWAY_MAX_*` settings in
+`.env.example`; hard validation ceilings also prevent arbitrary increases.
+These are byte/character bounds, not an exact provider input-token tokenizer.
+
+Production admission uses Redis atomic counters and expiring leases shared
+across processes and rolling deploys. Defaults allow eight provider requests
+in flight globally and two per key. Render lowers these to **four globally,
+one per key, and 256 output tokens**. An omitted output limit uses the lower
+server cap; explicit excess is rejected. Saturation returns 429; admission outages
+return 503. Leases release on completion, failure, timeout, or cancellation,
+and expire after the routing deadline plus ten seconds if a worker disappears.
+Shorter new leases cannot shorten older leases during a rolling deploy.
+
+Early throttling defaults to 300 API requests per minute globally and 120 per
+transport peer. Forwarded IP headers are deliberately not trusted: clients
+cannot rotate buckets by spoofing them. Render proxy peers may share a bucket;
+this conservative policy is for a small private demo, not large public traffic.
+Early 408/413/429/431 responses do not create telemetry rows or telemetry headers.
+Development/test admission uses process-local memory; production requires Redis.
+
+### Apply per-key rate limits before caching
 
 Redis atomically counts requests per key in a fixed window: the default is
 60 requests per 60 seconds, including cache hits. Exceeding it returns 429.
@@ -111,7 +142,23 @@ USD-per-million-token rates and decimal arithmetic. Compose selects
 `official-standard-text-2026-10-03`; recheck rates before billing decisions.
 `prices.json` and `prices.example.json` are **test pricing only**. Missing rates
 yield null cost and an unpriced-success count, not free usage. Invalid configured
-prices fail startup. Stored estimates are not recalculated when rates change.
+prices fail startup. Production additionally rejects incomplete/fixture pricing,
+weak/template keys, missing static assets, and invalid datastore configuration.
+Stored estimates are not recalculated when rates change.
+
+### Keep paid access private and explicitly enabled
+
+Production defaults `GATEWAY_PAID_PROVIDERS_ENABLED=false`. Until the owner
+explicitly enables it, chat returns 503 without calling either provider, while
+authenticated analytics and key management remain available. There is no public
+signup, shared demo key, or credential embedded in the frontend. Give invited
+users individual managed keys; keep the management key owner-only. All active
+managed keys currently allow both chat and their own analytics.
+
+This is **not a hard dollar budget**. Configure dedicated provider projects and
+provider-side limits/alerts before enabling paid calls. Best-effort PostgreSQL
+telemetry is for observation, never the authority for spending admission. A
+provider call cancelled locally may still incur upstream usage.
 
 ## Testing and verified results
 
@@ -120,11 +167,13 @@ strict overrides, deadlines, cache isolation/expiry, rate limiting, private
 telemetry, known-row analytics, and dependency failures. Provider responses in
 the automated suite are fake; no paid calls are needed.
 
-Checks without service URLs pass **64 backend tests**, with **5 integration
-tests skipped**; **3 frontend tests** also pass. Recorded full-service verification
-passed **69 backend tests** with real Redis/PostgreSQL, and the dashboard
-production build succeeded. The full-service result is recorded evidence; it
-does not establish current provider availability or production readiness.
+The deployment regression suite passes **109 backend tests with real local
+Redis/PostgreSQL**, including shared admission/lease expiry, bounded requests,
+production validation, same-origin routes, migration replay/rollback, and schema
+readiness. Frontend key-input tests and production builds are also checked.
+GitHub Actions runs real dependency services, migrations, the full suite,
+frontend tests/build/audit, and Docker image smoke checks. Passing local or CI
+checks does not establish hosted readiness.
 
 The fake-provider load script sends 40 requests at peak concurrency 5: ten cache
 warm-ups, ten repeats, sixteen unique requests, and four fallback cases. A
@@ -139,7 +188,7 @@ Node.js 22.12+, and npm:
 
 ```sh
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m pip install -c requirements.lock -e '.[test]'
 .venv/bin/python -m pytest -q
 (cd dashboard && npm ci && npm test && npm run build)
 ```
@@ -160,18 +209,92 @@ behavior. Live-provider availability, billing, and deployment need separate chec
 
 ## Known limitations
 
-- Local development stack only: the dashboard uses Vite's development server;
-  there is no cloud deployment or production security configuration.
+- Render configuration is prepared but unapplied. Hosting, platform validation,
+  TLS, backups, restore, rollback, and external account access need verification.
 - Text-only, nonstreaming chat; no separate administrator roles, key-rotation API,
   or key-creation audit log. The configured management key rotates via config.
 - Best-effort telemetry has no durable queue/replay. Database outages make
   analytics, management, and managed-key authentication unavailable (503).
-- `/health` checks liveness only. Authentication, Redis, and telemetry have
-  separate time bounds outside the provider-routing deadline.
+- `/health` checks liveness only. `/readyz` checks Redis and the current database
+  schema with a two-second budget and one-second cache; it never calls providers.
+  Authentication, ingress, and telemetry have separate bounds outside routing.
 - Cost estimates exclude provider prompt-cache billing adjustments, taxes, and
   unreported usage from failed attempts. Null estimates are omitted from totals.
 - Cache repeatability is a policy, not a guarantee of deterministic model output.
   Offset pagination can shift if new requests arrive between page reads.
+
+## Render demo configuration and release checks
+
+[`render.yaml`](render.yaml) defines one Docker web service with auto-deploys
+off, `/readyz` health checks, and `python -m gateway.migrate` as its pre-deploy
+command. The migration runner uses a database advisory lock, transactional SQL,
+and a statement timeout. Compose retains its services, migrations, volumes, and
+ports; its dashboard image now serves built assets through Nginx.
+
+The Render file contains **no credentials and no database/Key Value resources**.
+Supply private environment values through Render's secret configuration when
+you choose to deploy. Production ignores dotenv files so they cannot override
+injected secrets. Required values are `GATEWAY_API_KEY` (32–256 characters with
+sufficient variety), `DATABASE_URL`, `REDIS_URL`, aliases, and versioned pricing.
+Provider credentials are only needed when paid access is explicitly enabled;
+every alias's default provider must then have a valid configured credential.
+
+Use same-region Render Postgres/Key Value **internal URLs** with
+`GATEWAY_DATASTORE_NETWORK=render-private` (short `dpg-...` / `red-...` hosts).
+For other hosts use `tls`: PostgreSQL requires `sslmode=verify-full` and the
+appropriate CA; Redis requires `rediss://` with certificate and hostname
+verification. Configure a dedicated Key Value instance with **noeviction** and
+suitable persistence, block external access, and size its memory/connection
+limits. Do not share it with workloads that can evict or overwrite admission
+state. The prepared pre-deploy profile uses `DATABASE_URL` for both migrations and
+runtime. Before broader use, arrange separate migration/runtime roles; runtime
+needs only the application table permissions, not schema ownership.
+
+The web service's HTML is publicly reachable, but paid API access is key-gated.
+Render's network-private service type is different: it has no public browser URL.
+Add an outer identity/IP-access gate if the entire UI must be private. No keys
+should appear in URLs, logs, CI artifacts, or screenshots.
+
+Before enabling paid access, verify Render's Blueprint validation and chosen
+paid plan's pre-deploy support, CI results, actual TLS/internal connections,
+migration status, `/readyz`, UI/API routing, missing/incorrect/revoked-key
+rejection, security headers, and log redaction. Confirm admission saturation
+and dependency-outage behavior using **fake providers**, plus provider-account
+budget controls and the kill-switch procedure. Live-provider smoke calls need
+separate explicit authorization; none are required by CI.
+
+### Backup and rollback procedure
+
+1. Before a release, identify the last known-good build and configuration, keep
+   auto-deploys off, and confirm the database's actual backup/PITR availability,
+   retention, and recovery objectives. A named Docker volume is not a backup.
+2. Create a logical export or confirmed recovery point. Restore into a **new,
+   isolated database**, validate migrations, row totals, analytics, and managed
+   key/revocation state, then rehearse switching a nonproduction service to it.
+   Never test a destructive restore against the active database.
+3. For rollback, disable paid access and independently suspend/restrict provider
+   credentials first. Roll back the application to the retained Render build;
+   do not rebuild an old commit and assume identical artifacts. Database changes
+   are not undone by application rollback. Keep migrations backward compatible;
+   restore/switch databases only after checking data loss and schema compatibility.
+4. Recheck the kill switch and secrets after rollback: Render can restore
+   service-level environment variables, while environment-group values and disks
+   have different rollback behavior. A database restore can resurrect revoked
+   keys; reconcile/revoke or rotate them before re-enabling paid access.
+5. Validate readiness, authenticated analytics, revocation, and fake-provider
+   requests, then enable paid calls only by owner decision. Retain the original
+   database until the restored instance is verified. Do not flush shared Redis;
+   verify admission state and cache isolation after recovery.
+
+These are procedures to verify, not completed hosted backup/rollback drills.
+Render documents [web services](https://render.com/docs/web-services),
+[Blueprint configuration](https://render.com/docs/blueprint-spec),
+[health checks](https://render.com/docs/health-checks),
+[private services](https://render.com/docs/private-services),
+[Postgres connections](https://render.com/docs/postgresql-creating-connecting),
+[Key Value networking](https://render.com/docs/key-value),
+[database recovery](https://render.com/docs/postgresql-backups), and
+[rollbacks](https://render.com/docs/rollbacks).
 
 ## Author
 
