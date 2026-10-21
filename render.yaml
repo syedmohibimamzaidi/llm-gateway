@@ -1,4 +1,3 @@
-# Configuration only. No resources have been created or deployed.
 # Supply Neon direct PostgreSQL and Upstash native Redis TLS URLs privately.
 # Upstash console: keep Eviction DISABLED; this file cannot configure that account.
 services:
